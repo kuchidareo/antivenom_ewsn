@@ -29,7 +29,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--epochs", type=int, default=10)
 
     # Data
-    p.add_argument("--dataset", type=str, default="kuchidareo/trashnet_small")
+    p.add_argument("--dataset", type=str, default="kuchidareo/small_trashnet")
     p.add_argument("--config", type=str, default=None)
     p.add_argument("--data-root", type=str, default="data", help="Root containing blurring/occlusion/label-flip/")
     p.add_argument("--poison-frac", type=float, default=1.0)
@@ -49,6 +49,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--log-root", type=str, default="logs_batch")
     p.add_argument("--log-fps", type=float, default=1.0)
 
+    # Subsampling
+    p.add_argument("--train-frac", type=float, default=1.0, help="Fraction of train split to use (0..1)")
+    p.add_argument("--test-frac", type=float, default=1.0, help="Fraction of test split to use (0..1)")
+
     # Controls
     p.add_argument(
         "--modes",
@@ -57,6 +61,17 @@ def parse_args() -> argparse.Namespace:
         default=["none", "blurring", "occlusion", "label-flip"],
         choices=["none", "blurring", "occlusion", "label-flip"],
         help="Which modes to run",
+    )
+    p.add_argument(
+        "--prepare-data",
+        action="store_true",
+        help="If set, run data_preparing.py when poison data is missing",
+    )
+    p.add_argument(
+        "--prepare-max-per-split",
+        type=int,
+        default=None,
+        help="Optional cap per split when preparing poison data",
     )
 
     return p.parse_args()
@@ -97,6 +112,10 @@ def run_one(mode: str, args: argparse.Namespace) -> None:
         str(log_dir),
         "--log-fps",
         str(args.log_fps),
+        "--train-frac",
+        str(args.train_frac),
+        "--test-frac",
+        str(args.test_frac),
     ]
 
     if args.config:
@@ -114,8 +133,59 @@ def run_one(mode: str, args: argparse.Namespace) -> None:
     subprocess.run(cmd, check=True)
 
 
+def _poison_data_missing(data_root: str) -> bool:
+    base = Path(data_root)
+    required = [
+        base / "blurring" / "metadata.jsonl",
+        base / "occlusion" / "metadata.jsonl",
+        base / "label-flip" / "metadata.jsonl",
+    ]
+    return any(not p.exists() for p in required)
+
+
+def maybe_prepare_data(args: argparse.Namespace) -> None:
+    if not _poison_data_missing(args.data_root):
+        return
+    if not args.prepare_data:
+        missing = [
+            str(p)
+            for p in (
+                Path(args.data_root) / "blurring" / "metadata.jsonl",
+                Path(args.data_root) / "occlusion" / "metadata.jsonl",
+                Path(args.data_root) / "label-flip" / "metadata.jsonl",
+            )
+            if not p.exists()
+        ]
+        raise FileNotFoundError(
+            "Missing poison data. Run data_preparing.py or pass --prepare-data. "
+            f"Missing: {', '.join(missing)}"
+        )
+
+    here = Path(__file__).resolve().parent
+    prep_script = here / "data_preparing.py"
+    cmd: List[str] = [
+        sys.executable,
+        str(prep_script),
+        "--dataset",
+        args.dataset,
+        "--out",
+        args.data_root,
+    ]
+    if args.config:
+        cmd.extend(["--config", args.config])
+    if args.prepare_max_per_split is not None:
+        cmd.extend(["--max-per-split", str(args.prepare_max_per_split)])
+
+    print("\n=== Preparing data ===")
+    print(" ".join(cmd))
+    subprocess.run(cmd, check=True)
+
+
 def main() -> None:
     args = parse_args()
+
+    if any(m in ("blurring", "occlusion", "label-flip") for m in args.modes):
+        maybe_prepare_data(args)
 
     for mode in args.modes:
         run_one(mode, args)

@@ -57,6 +57,7 @@ from PIL import Image
 
 # System metrics
 import psutil
+from tqdm import tqdm
 
 
 # =============================
@@ -552,7 +553,8 @@ def train_one_epoch(
 
     global_step = global_step_start
 
-    for step, (x, y) in enumerate(loader):
+    pbar = tqdm(loader, desc=f"epoch {epoch}", leave=True)
+    for step, (x, y) in enumerate(pbar):
         x = x.to(device)
         y = y.to(device)
 
@@ -569,6 +571,7 @@ def train_one_epoch(
         # Update logger state (will be sampled at 1 FPS)
         lr = float(optim.param_groups[0].get("lr", 0.0))
         logger.update_state(epoch=epoch, step=step, global_step=global_step, loss=float(loss.item()), lr=lr, acc=acc)
+        pbar.set_postfix(loss=f"{loss.item():.4f}", acc=f"{acc:.3f}", lr=f"{lr:.2e}")
 
         global_step += 1
 
