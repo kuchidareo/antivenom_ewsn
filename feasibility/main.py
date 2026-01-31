@@ -1,7 +1,7 @@
 """Batch runner for feasibility experiments.
 
-Runs ml_running.py for:
-- clean (poison-type=none)
+    Runs ml_running.py for:
+- clean (poison-type=clean, from disk)
 - blurring
 - occlusion
 - label-flip
@@ -58,8 +58,8 @@ def parse_args() -> argparse.Namespace:
         "--modes",
         type=str,
         nargs="+",
-        default=["none", "blurring", "occlusion", "label-flip"],
-        choices=["none", "blurring", "occlusion", "label-flip"],
+        default=["clean", "blurring", "occlusion", "label-flip"],
+        choices=["none", "clean", "blurring", "occlusion", "label-flip"],
         help="Which modes to run",
     )
     p.add_argument(
@@ -82,7 +82,7 @@ def run_one(mode: str, args: argparse.Namespace) -> None:
     here = Path(__file__).resolve().parent
     ml_script = here / "ml_running.py"
 
-    log_dir = Path(args.log_root) / ("clean" if mode == "none" else mode)
+    log_dir = Path(args.log_root) / ("clean" if mode in ("none", "clean") else mode)
     log_dir.mkdir(parents=True, exist_ok=True)
 
     cmd: List[str] = [
@@ -136,6 +136,7 @@ def run_one(mode: str, args: argparse.Namespace) -> None:
 def _poison_data_missing(data_root: str) -> bool:
     base = Path(data_root)
     required = [
+        base / "clean" / "metadata.jsonl",
         base / "blurring" / "metadata.jsonl",
         base / "occlusion" / "metadata.jsonl",
         base / "label-flip" / "metadata.jsonl",
@@ -184,7 +185,7 @@ def maybe_prepare_data(args: argparse.Namespace) -> None:
 def main() -> None:
     args = parse_args()
 
-    if any(m in ("blurring", "occlusion", "label-flip") for m in args.modes):
+    if any(m in ("clean", "blurring", "occlusion", "label-flip") for m in args.modes):
         maybe_prepare_data(args)
 
     for mode in args.modes:

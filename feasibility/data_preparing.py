@@ -58,7 +58,7 @@ class PreprocessConfig:
     occlusion_max_frac: float = 0.50  # max fraction of width/height
 
 
-VARIANTS = ("blurring", "occlusion", "label-flip")
+VARIANTS = ("clean", "blurring", "occlusion", "label-flip")
 
 
 # -----------------------------
@@ -200,6 +200,7 @@ def process_split(
     n = len(ds)
     limit = min(n, max_per_split) if max_per_split is not None else n
 
+    clean_meta = out_root / "clean" / "metadata.jsonl"
     blur_meta = out_root / "blurring" / "metadata.jsonl"
     occ_meta = out_root / "occlusion" / "metadata.jsonl"
     flip_meta = out_root / "label-flip" / "metadata.jsonl"
@@ -224,6 +225,23 @@ def process_split(
         # Create a per-sample RNG so label-flip/occlusion are deterministic per sample.
         sample_seed = int(hashlib.sha1(f"{cfg.seed}:{split_name}:{idx}".encode("utf-8")).hexdigest()[:8], 16)
         rng = random.Random(sample_seed)
+
+        # 0) clean (no change)
+        v = "clean"
+        file_id = stable_id(split_name, idx, v)
+        filename = f"{split_name}_{file_id}.jpg"
+        out_path = out_root / v / filename
+        save_jpeg(img, out_path)
+        append_jsonl(
+            clean_meta,
+            {
+                "file": filename,
+                "label": label,
+                "split": split_name,
+                "orig_label": label,
+                "label_name": label_name,
+            },
+        )
 
         # 1) blurring
         v = "blurring"

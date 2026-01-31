@@ -311,6 +311,8 @@ class MetricsCollector:
 class SystemCollector(MetricsCollector):
     def __init__(self, proc: psutil.Process) -> None:
         self.proc = proc
+        self._last_disk = None
+        self._last_ts = None
 
         # warm-up for cpu_percent
         psutil.cpu_percent(interval=None)
@@ -361,6 +363,7 @@ class SystemCollector(MetricsCollector):
 
     def collect(self) -> Dict[str, Any]:
         now = dt.datetime.now(dt.timezone.utc)
+        now_ts = now.timestamp()
 
         # CPU
         cpu_total = psutil.cpu_percent(interval=None)
@@ -379,9 +382,33 @@ class SystemCollector(MetricsCollector):
 
         temp_c = self._cpu_temperature_c()
 
+        # Disk IO (system-wide counters)
+        disk = psutil.disk_io_counters()
+        if disk is not None:
+            read_bytes = disk.read_bytes
+            write_bytes = disk.write_bytes
+            read_count = disk.read_count
+            write_count = disk.write_count
+        else:
+            read_bytes = write_bytes = read_count = write_count = None
+
+        # Deltas since last sample
+        if self._last_disk is not None and self._last_ts is not None and disk is not None:
+            dt_sec = max(now_ts - self._last_ts, 1e-6)
+            read_bytes_delta = read_bytes - self._last_disk.read_bytes
+            write_bytes_delta = write_bytes - self._last_disk.write_bytes
+            read_bps = read_bytes_delta / dt_sec
+            write_bps = write_bytes_delta / dt_sec
+        else:
+            read_bytes_delta = write_bytes_delta = None
+            read_bps = write_bps = None
+
+        self._last_disk = disk
+        self._last_ts = now_ts
+
         out: Dict[str, Any] = {
             "ts_iso": now.isoformat(),
-            "ts_unix": now.timestamp(),
+            "ts_unix": now_ts,
             "cpu_percent": cpu_total,
             "cpu_per_core": json.dumps(cpu_per_core),
             "mem_percent": vm.percent,
@@ -389,6 +416,14 @@ class SystemCollector(MetricsCollector):
             "proc_cpu_percent": p_cpu,
             "proc_rss": p_mem,
             "cpu_temp_c": temp_c,
+            "disk_read_bytes": read_bytes,
+            "disk_write_bytes": write_bytes,
+            "disk_read_count": read_count,
+            "disk_write_count": write_count,
+            "disk_read_bytes_delta": read_bytes_delta,
+            "disk_write_bytes_delta": write_bytes_delta,
+            "disk_read_bps": read_bps,
+            "disk_write_bps": write_bps,
         }
 
         return out
@@ -633,7 +668,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dataset", type=str, default="kuchidareo/trashnet_small")
     p.add_argument("--config", type=str, default=None, help="HF dataset config name (if needed)")
     p.add_argument("--data-root", type=str, default="data", help="Root containing poisoning dirs")
-    p.add_argument("--poison-type", type=str, default="none", choices=["none", "blurring", "occlusion", "label-flip"])
+    p.add_argument(
+        "--poison-type",
+        type=str,
+        default="none",
+        choices=["none", "clean", "blurring", "occlusion", "label-flip"],
+    )
     p.add_argument("--poison-frac", type=float, default=1.0, help="Fraction of poison samples to add (0..1)")
 
     # Training
@@ -708,6 +748,10 @@ def main() -> None:
     train_ds: Dataset
     if args.poison_type == "none":
         train_ds = clean_train
+    elif args.poison_type == "clean":
+        variant_dir = Path(args.data_root) / "clean"
+        clean_disk = PoisonDiskDataset(variant_dir=variant_dir, split_name=train_split, tfm_cfg=tfm_cfg)
+        train_ds = subsample_dataset(clean_disk, frac=float(args.train_frac), seed=args.seed + 2)
     else:
         variant_dir = Path(args.data_root) / args.poison_type
         poison_train = PoisonDiskDataset(variant_dir=variant_dir, split_name=train_split, tfm_cfg=tfm_cfg)
