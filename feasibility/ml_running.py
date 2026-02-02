@@ -256,6 +256,19 @@ def subsample_dataset(ds: Dataset, frac: float, seed: int) -> Dataset:
     return torch.utils.data.Subset(ds, idxs)
 
 
+def sample_n_dataset(ds: Dataset, n: int, seed: int) -> Dataset:
+    if n <= 0:
+        return torch.utils.data.Subset(ds, [])
+    total = len(ds)
+    if n >= total:
+        return ds
+    rng = random.Random(seed)
+    idxs = list(range(total))
+    rng.shuffle(idxs)
+    idxs = idxs[:n]
+    return torch.utils.data.Subset(ds, idxs)
+
+
 # =============================
 # Model: simple CNN (3 conv, 3 fc)
 # =============================
@@ -746,18 +759,26 @@ def main() -> None:
     clean_test = subsample_dataset(clean_test, frac=float(args.test_frac), seed=args.seed + 1)
 
     train_ds: Dataset
+    target_n = len(clean_train)
     if args.poison_type == "none":
         train_ds = clean_train
     elif args.poison_type == "clean":
         variant_dir = Path(args.data_root) / "clean"
         clean_disk = PoisonDiskDataset(variant_dir=variant_dir, split_name=train_split, tfm_cfg=tfm_cfg)
-        train_ds = subsample_dataset(clean_disk, frac=float(args.train_frac), seed=args.seed + 2)
+        clean_disk = subsample_dataset(clean_disk, frac=float(args.train_frac), seed=args.seed + 2)
+        train_ds = sample_n_dataset(clean_disk, n=target_n, seed=args.seed + 3)
     else:
         variant_dir = Path(args.data_root) / args.poison_type
         poison_train = PoisonDiskDataset(variant_dir=variant_dir, split_name=train_split, tfm_cfg=tfm_cfg)
         poison_train = subsample_dataset(poison_train, frac=float(args.train_frac), seed=args.seed + 2)
-        poison_sampled = sample_poison_dataset(poison_train, poison_frac=float(args.poison_frac), seed=args.seed)
-        train_ds = ConcatDataset([clean_train, poison_sampled])
+
+        poison_k = int(round(target_n * float(args.poison_frac)))
+        poison_k = max(0, min(poison_k, len(poison_train)))
+        clean_k = max(0, target_n - poison_k)
+
+        poison_sampled = sample_n_dataset(poison_train, n=poison_k, seed=args.seed)
+        clean_sampled = sample_n_dataset(clean_train, n=clean_k, seed=args.seed + 1)
+        train_ds = ConcatDataset([clean_sampled, poison_sampled])
 
     train_loader = DataLoader(
         train_ds,
