@@ -44,9 +44,12 @@ except Exception as e:
     print("WARNING: python deps missing:", e)
 PY
 
-# 作業ディレクトリを毎回クリーンに
+# 作業ディレクトリを毎回クリーンに（bash/zsh 両対応: glob が空でも落ちない）
 mkdir -p "$IO_DIR"
-rm -rf "$IO_DIR"/* || true
+if [ -d "$IO_DIR" ]; then
+  # zsh の `nomatch` 対策: シェル glob を使わずに中身だけ削除
+  find "$IO_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + 2>/dev/null || true
+fi
 
 ### ====== perception.py 生成 ======
 PERCEPTION_PY="$(mktemp -p /tmp bg_perception.XXXXXX.py)"
@@ -218,7 +221,9 @@ cleanup() {
     kill "$pid" 2>/dev/null || true
   done
   # 片付け（IO_DIR 中身を消す）
-  rm -rf "$IO_DIR"/* || true
+  if [ -d "$IO_DIR" ]; then
+    find "$IO_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + 2>/dev/null || true
+  fi
 }
 trap cleanup EXIT
 
