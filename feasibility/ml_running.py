@@ -688,6 +688,12 @@ def parse_args() -> argparse.Namespace:
         choices=["none", "clean", "blurring", "occlusion", "label-flip"],
     )
     p.add_argument("--poison-frac", type=float, default=1.0, help="Fraction of poison samples to add (0..1)")
+    p.add_argument(
+        "--background-script",
+        type=str,
+        default=None,
+        help="Background workload script (logged only)",
+    )
 
     # Training
     p.add_argument("--epochs", type=int, default=5)
@@ -843,6 +849,7 @@ def main() -> None:
                     "platform": platform.platform(),
                     "python": platform.python_version(),
                     "torch": torch.__version__,
+                    "background_script": args.background_script,
                 }
             },
             ensure_ascii=False,

@@ -73,6 +73,18 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional cap per split when preparing poison data",
     )
+    p.add_argument(
+        "--background-script",
+        type=str,
+        default=None,
+        help="Optional background workload script to run during training",
+    )
+    p.add_argument(
+        "--background-warmup-sec",
+        type=float,
+        default=3.0,
+        help="Warmup time before training starts (seconds)",
+    )
 
     return p.parse_args()
 
@@ -130,6 +142,8 @@ def run_one(mode: str, args: argparse.Namespace) -> None:
     print("\n=== Running ===")
     print(" ".join(cmd))
 
+    if args.background_script:
+        cmd.extend(["--background-script", args.background_script])
     subprocess.run(cmd, check=True)
 
 
@@ -188,8 +202,30 @@ def main() -> None:
     if any(m in ("clean", "blurring", "occlusion", "label-flip") for m in args.modes):
         maybe_prepare_data(args)
 
-    for mode in args.modes:
-        run_one(mode, args)
+    bg_proc = None
+    if args.background_script:
+        bg_proc = subprocess.Popen(
+            ["bash", args.background_script],
+            start_new_session=True,
+        )
+        if args.background_warmup_sec > 0:
+            import time
+
+            time.sleep(float(args.background_warmup_sec))
+
+    try:
+        for mode in args.modes:
+            run_one(mode, args)
+    finally:
+        if bg_proc is not None:
+            try:
+                bg_proc.terminate()
+                bg_proc.wait(timeout=5.0)
+            except Exception:
+                try:
+                    bg_proc.kill()
+                except Exception:
+                    pass
 
 
 if __name__ == "__main__":
