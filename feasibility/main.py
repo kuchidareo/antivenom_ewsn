@@ -63,6 +63,30 @@ def parse_args() -> argparse.Namespace:
         help="Which modes to run",
     )
     p.add_argument(
+        "--background-script",
+        type=str,
+        default=None,
+        help="Background workload script to run during training (per-epoch bursts)",
+    )
+    p.add_argument(
+        "--background-bursts-per-epoch",
+        type=int,
+        default=0,
+        help="Number of background bursts per epoch (0 disables)",
+    )
+    p.add_argument(
+        "--background-burst-on-sec",
+        type=int,
+        default=10,
+        help="ON duration per background burst (seconds)",
+    )
+    p.add_argument(
+        "--background-burst-threads",
+        type=int,
+        default=0,
+        help="Threads for background bursts (0=auto)",
+    )
+    p.add_argument(
         "--prepare-data",
         action="store_true",
         help="If set, run data_preparing.py when poison data is missing",
@@ -73,19 +97,6 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional cap per split when preparing poison data",
     )
-    p.add_argument(
-        "--background-script",
-        type=str,
-        default=None,
-        help="Optional background workload script to run during training",
-    )
-    p.add_argument(
-        "--background-warmup-sec",
-        type=float,
-        default=3.0,
-        help="Warmup time before training starts (seconds)",
-    )
-
     return p.parse_args()
 
 
@@ -144,6 +155,9 @@ def run_one(mode: str, args: argparse.Namespace) -> None:
 
     if args.background_script:
         cmd.extend(["--background-script", args.background_script])
+        cmd.extend(["--background-bursts-per-epoch", str(args.background_bursts_per_epoch)])
+        cmd.extend(["--background-burst-on-sec", str(args.background_burst_on_sec)])
+        cmd.extend(["--background-burst-threads", str(args.background_burst_threads)])
     subprocess.run(cmd, check=True)
 
 
@@ -202,30 +216,8 @@ def main() -> None:
     if any(m in ("clean", "blurring", "occlusion", "label-flip") for m in args.modes):
         maybe_prepare_data(args)
 
-    bg_proc = None
-    if args.background_script:
-        bg_proc = subprocess.Popen(
-            ["bash", args.background_script],
-            start_new_session=True,
-        )
-        if args.background_warmup_sec > 0:
-            import time
-
-            time.sleep(float(args.background_warmup_sec))
-
-    try:
-        for mode in args.modes:
-            run_one(mode, args)
-    finally:
-        if bg_proc is not None:
-            try:
-                bg_proc.terminate()
-                bg_proc.wait(timeout=5.0)
-            except Exception:
-                try:
-                    bg_proc.kill()
-                except Exception:
-                    pass
+    for mode in args.modes:
+        run_one(mode, args)
 
 
 if __name__ == "__main__":

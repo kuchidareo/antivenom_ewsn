@@ -35,6 +35,7 @@ import json
 import os
 import platform
 import random
+import subprocess
 import threading
 import time
 from dataclasses import dataclass
@@ -595,14 +596,65 @@ def train_one_epoch(
     logger: CSVRunLogger,
     epoch: int,
     global_step_start: int,
+    bg_cfg: Optional[Dict[str, Any]] = None,
+    seed: int = 0,
 ) -> int:
     model.train()
     criterion = nn.CrossEntropyLoss()
 
     global_step = global_step_start
+    burst_steps: List[int] = []
+    procs: List[subprocess.Popen] = []
+
+    if bg_cfg is not None and int(bg_cfg.get("bursts_per_epoch", 0)) > 0:
+        n_steps = len(loader)
+        k = min(int(bg_cfg["bursts_per_epoch"]), max(n_steps, 1))
+        rng = random.Random(seed + 1000 * epoch)
+        if n_steps > 0:
+            burst_steps = sorted(rng.sample(range(n_steps), k=k))
+        else:
+            burst_steps = [0] * k
+        logger.mark_event(
+            json.dumps(
+                {"bg_bursts": {"epoch": epoch, "steps": burst_steps, "cfg": bg_cfg}},
+                ensure_ascii=False,
+            )
+        )
 
     pbar = tqdm(loader, desc=f"epoch {epoch}", leave=True)
     for step, (x, y) in enumerate(pbar):
+        if bg_cfg is not None and burst_steps and step in burst_steps:
+            cmd = [
+                "bash",
+                str(bg_cfg["script"]),
+                "--on-sec",
+                str(bg_cfg["on_sec"]),
+                "--threads",
+                str(bg_cfg["threads"]),
+            ]
+            try:
+                proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                procs.append(proc)
+                logger.mark_event(
+                    json.dumps(
+                        {"bg_burst_start": {"epoch": epoch, "step": step, "cmd": cmd}},
+                        ensure_ascii=False,
+                    )
+                )
+            except Exception as e:
+                logger.mark_event(
+                    json.dumps(
+                        {
+                            "bg_burst_error": {
+                                "epoch": epoch,
+                                "step": step,
+                                "error": f"{type(e).__name__}: {e}",
+                                "cmd": cmd,
+                            }
+                        },
+                        ensure_ascii=False,
+                    )
+                )
         x = x.to(device)
         y = y.to(device)
 
@@ -622,6 +674,33 @@ def train_one_epoch(
         pbar.set_postfix(loss=f"{loss.item():.4f}", acc=f"{acc:.3f}", lr=f"{lr:.2e}")
 
         global_step += 1
+
+    # Terminate any remaining background bursts at epoch end
+    for proc in procs:
+        try:
+            ret = proc.poll()
+            if ret is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2.0)
+                except Exception:
+                    proc.kill()
+                    proc.wait(timeout=2.0)
+                logger.mark_event(
+                    json.dumps(
+                        {"bg_burst_end": {"epoch": epoch, "status": "terminated"}},
+                        ensure_ascii=False,
+                    )
+                )
+            else:
+                logger.mark_event(
+                    json.dumps(
+                        {"bg_burst_end": {"epoch": epoch, "status": "exited", "code": int(ret)}},
+                        ensure_ascii=False,
+                    )
+                )
+        except Exception:
+            pass
 
     return global_step
 
@@ -692,7 +771,25 @@ def parse_args() -> argparse.Namespace:
         "--background-script",
         type=str,
         default=None,
-        help="Background workload script (logged only)",
+        help="Background workload script (per-epoch bursts)",
+    )
+    p.add_argument(
+        "--background-bursts-per-epoch",
+        type=int,
+        default=0,
+        help="Number of background bursts per epoch (0 disables)",
+    )
+    p.add_argument(
+        "--background-burst-on-sec",
+        type=int,
+        default=10,
+        help="ON duration per background burst (seconds)",
+    )
+    p.add_argument(
+        "--background-burst-threads",
+        type=int,
+        default=0,
+        help="Threads for background bursts (0=auto)",
     )
 
     # Training
@@ -850,6 +947,9 @@ def main() -> None:
                     "python": platform.python_version(),
                     "torch": torch.__version__,
                     "background_script": args.background_script,
+                    "background_bursts_per_epoch": int(args.background_bursts_per_epoch),
+                    "background_burst_on_sec": int(args.background_burst_on_sec),
+                    "background_burst_threads": int(args.background_burst_threads),
                 }
             },
             ensure_ascii=False,
@@ -867,6 +967,14 @@ def main() -> None:
     logger.mark_event("train_start")
 
     try:
+        bg_cfg: Optional[Dict[str, Any]] = None
+        if args.background_script:
+            bg_cfg = {
+                "script": str(args.background_script),
+                "bursts_per_epoch": int(args.background_bursts_per_epoch),
+                "on_sec": int(args.background_burst_on_sec),
+                "threads": int(args.background_burst_threads),
+            }
         for epoch in range(int(args.epochs)):
             global_step = train_one_epoch(
                 model=model,
@@ -876,6 +984,8 @@ def main() -> None:
                 logger=logger,
                 epoch=epoch,
                 global_step_start=global_step,
+                bg_cfg=bg_cfg,
+                seed=int(args.seed),
             )
 
             # Mark end of each epoch
