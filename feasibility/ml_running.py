@@ -48,6 +48,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torchvision import models
 from torch.utils.data import ConcatDataset, DataLoader, Dataset
 
 # HF deps
@@ -310,6 +311,17 @@ class SimpleCNN(nn.Module):
         x = F.relu(self.fc2(x))
         x = self.fc3(x)
         return x
+
+
+class MobileNetV3Large(nn.Module):
+    def __init__(self, num_classes: int) -> None:
+        super().__init__()
+        self.model = models.mobilenet_v3_large(weights=models.MobileNet_V3_Large_Weights.IMAGENET1K_V2)
+        in_features = self.model.classifier[-1].in_features
+        self.model.classifier[-1] = nn.Linear(in_features, num_classes)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.model(x)
 
 
 # =============================
@@ -803,6 +815,12 @@ def parse_args() -> argparse.Namespace:
     # Image
     p.add_argument("--img-size", type=int, default=None, help="If not set, infer from dataset sample")
     p.add_argument("--normalize", type=str, default="0.5", choices=["none", "0.5", "imagenet"])
+    p.add_argument(
+        "--model",
+        type=str,
+        default="simple_cnn",
+        choices=["simple_cnn", "mobilenet_v3_large"],
+    )
 
     # Logging
     p.add_argument("--log-dir", type=str, default="logs")
@@ -900,7 +918,10 @@ def main() -> None:
     )
 
     # Model
-    model = SimpleCNN(n_classes=n_classes, img_size=int(img_size)).to(device)
+    if args.model == "mobilenet_v3_large":
+        model = MobileNetV3Large(num_classes=n_classes).to(device)
+    else:
+        model = SimpleCNN(n_classes=n_classes, img_size=int(img_size)).to(device)
     optim = torch.optim.Adam(model.parameters(), lr=float(args.lr))
 
     # Logger
@@ -946,6 +967,7 @@ def main() -> None:
                     "platform": platform.platform(),
                     "python": platform.python_version(),
                     "torch": torch.__version__,
+                    "model": args.model,
                     "background_script": args.background_script,
                     "background_bursts_per_epoch": int(args.background_bursts_per_epoch),
                     "background_burst_on_sec": int(args.background_burst_on_sec),

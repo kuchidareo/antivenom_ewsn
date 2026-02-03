@@ -37,6 +37,12 @@ def parse_args() -> argparse.Namespace:
     # Image / transforms
     p.add_argument("--img-size", type=int, default=None)
     p.add_argument("--normalize", type=str, default="0.5", choices=["none", "0.5", "imagenet"])
+    p.add_argument(
+        "--model",
+        type=str,
+        default="simple_cnn",
+        choices=["simple_cnn", "mobilenet_v3_large"],
+    )
 
     # Training
     p.add_argument("--batch-size", type=int, default=64)
@@ -156,6 +162,8 @@ def run_one(mode: str, args: argparse.Namespace) -> None:
 
     if args.device:
         cmd.extend(["--device", args.device])
+    if args.model:
+        cmd.extend(["--model", args.model])
 
     print("\n=== Running ===")
     print(" ".join(cmd))
