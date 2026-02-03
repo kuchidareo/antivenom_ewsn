@@ -1,84 +1,83 @@
 #!/usr/bin/env bash
-# run_bg_workloads.sh
-# 背景負荷(Perception/Comms/Logging+定期クリーン)を起動
-# 依存: python3, OpenCV(cv2), numpy, requests, iperf3
+# Background workloads (Perception / Comms / LogMap)
+# Always run under systemd CPUQuota=20% (when systemd-run is available).
 
 set -euo pipefail
 
-### ====== 設定 ======
-# Perception
-FEATURE="${FEATURE:-orb}"            # orb / fast
-CAM_INDEX="${CAM_INDEX:-0}"          # /dev/videoN -> N
-TARGET_FPS="${TARGET_FPS:-30}"
+# ---- Force CPU quota (20%) via systemd-run scope ----
+if [ "${BG_CPUQUOTA_WRAPPED:-0}" != "1" ]; then
+  if command -v systemd-run >/dev/null 2>&1; then
+    # Quote args safely for bash -lc
+    qargs=()
+    for a in "$@"; do
+      qargs+=("$(printf '%q' "$a")")
+    done
+    self_q="$(printf '%q' "$0")"
+    exec systemd-run --scope -p CPUQuota=20% bash -lc "BG_CPUQUOTA_WRAPPED=1 ${self_q} ${qargs[*]}"
+  else
+    echo "[bg] WARNING: systemd-run not found; running without CPUQuota" >&2
+  fi
+fi
 
-# Communications
-IPERF_SERVER="${IPERF_SERVER:-192.0.2.10}"   # 置き換え必須（iperf3 サーバ）
-UPLOAD_MBIT="${UPLOAD_MBIT:-15}"             # 10–20 推奨
-BURST_SEC="${BURST_SEC:-1}"                  # おおよそ 1 秒ごとにバースト
+# ---- tmpfs preferred (avoid SD/eMMC writes) ----
+TMPDIR_DEFAULT="/dev/shm"
+if [ -d "${TMPDIR_DEFAULT}" ] && [ -w "${TMPDIR_DEFAULT}" ]; then
+  TMPDIR="${TMPDIR_DEFAULT}"
+else
+  TMPDIR="/tmp"
+fi
+LOG_DIR="${TMPDIR}"
 
-# Logging/Mapping
-IO_DIR="${IO_DIR:-/tmp/bg_io}"
-TILE_URL="${TILE_URL:-https://tile.openstreetmap.org/10/550/340.png}"  # 実験ではレート注意
-TILE_PERIOD_SEC="${TILE_PERIOD_SEC:-7}"                                 # 5–10 秒レンジ
-CLEAN_PERIOD_SEC="${CLEAN_PERIOD_SEC:-3600}"                             # ディスク掃除の周期(秒)
+# ---- Settings ----
+FEATURE="${FEATURE:-fast}"          # fast / orb
+CAM_INDEX="${CAM_INDEX:-0}"
+TARGET_FPS="${TARGET_FPS:-10}"
 
-# CPU ピン留め（存在コアに合わせて調整）
-CPU_PERCEPTION="${CPU_PERCEPTION:-0}"
-CPU_COMMS="${CPU_COMMS:-1}"
-CPU_LOGMAP="${CPU_LOGMAP:-2}"
+IPERF_SERVER="${IPERF_SERVER:-192.0.2.10}"  # replace with real iperf3 server
+UPLOAD_MBIT="${UPLOAD_MBIT:-2}"
+BURST_SEC="${BURST_SEC:-1}"
+
+IO_DIR="${IO_DIR:-${TMPDIR}/bg_io}"
+TILE_URL="${TILE_URL:-https://tile.openstreetmap.org/10/550/340.png}"
+TILE_PERIOD_SEC="${TILE_PERIOD_SEC:-7}"
+CLEAN_PERIOD_SEC="${CLEAN_PERIOD_SEC:-3600}"
+
+# LogMap defaults: run, but no disk I/O (SD/eMMC protection)
+LOGMAP_IO=0
+LOGMAP_NET=1
 
 PYTHON_BIN="${PYTHON_BIN:-/usr/bin/python3}"
 
-### ====== 依存チェック(甘め) ======
-command -v iperf3 >/dev/null || { echo "iperf3 が必要"; exit 1; }
-$PYTHON_BIN - <<'PY' >/dev/null 2>&1 || { echo "python3 必須"; exit 1; }
-print("ok")
-PY
-
-# 最低限の Python パッケージ確認（なければ pip で入れろ）
-$PYTHON_BIN - <<'PY' || true
-try:
-    import cv2, numpy, requests  # noqa
-    print("python deps ok")
-except Exception as e:
-    print("WARNING: python deps missing:", e)
-PY
-
-# 作業ディレクトリを毎回クリーンに（bash/zsh 両対応: glob が空でも落ちない）
-mkdir -p "$IO_DIR"
-if [ -d "$IO_DIR" ]; then
-  # zsh の `nomatch` 対策: シェル glob を使わずに中身だけ削除
-  find "$IO_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + 2>/dev/null || true
-fi
-
-### ====== perception.py 生成 ======
-PERCEPTION_PY="$(mktemp -p /tmp bg_perception.XXXXXX.py)"
-cat > "$PERCEPTION_PY" <<'PY'
+# ---- Generate perception workload ----
+PERCEPTION_PY="$(mktemp -p "${TMPDIR}" bg_perception.XXXXXX.py)"
+cat > "${PERCEPTION_PY}" <<'PY'
 import os, time
 import numpy as np
 import cv2 as cv
 
-FEATURE = os.getenv("FEATURE","orb").lower()
+FEATURE = os.getenv("FEATURE","fast").lower()
 CAM_INDEX = int(os.getenv("CAM_INDEX","0"))
-TARGET_FPS = float(os.getenv("TARGET_FPS","30"))
-period = 1.0 / TARGET_FPS
+TARGET_FPS = float(os.getenv("TARGET_FPS","10"))
+period = 1.0 / max(TARGET_FPS, 0.1)
 
 cap = cv.VideoCapture(CAM_INDEX)
-use_synthetic = False
-if not cap.isOpened():
-    use_synthetic = True
+use_synthetic = not cap.isOpened()
+if use_synthetic:
     w,h = 640,480
     frame = (np.random.rand(h,w,3)*255).astype(np.uint8)
 
-if FEATURE == "fast":
-    det = cv.FastFeatureDetector_create(threshold=20, nonmaxSuppression=True)
-    def run_feat(img): return det.detect(img, None)
-else:
+if FEATURE == "orb":
     det = cv.ORB_create(nfeatures=500)
-    def run_feat(img): return det.detectAndCompute(img, None)
+    def run_feat(img):
+        det.detectAndCompute(img, None)
+else:
+    det = cv.FastFeatureDetector_create(threshold=20, nonmaxSuppression=True)
+    def run_feat(img):
+        det.detect(img, None)
 
 while True:
     t0 = time.time()
+
     if use_synthetic:
         img = frame
         _, buf = cv.imencode(".jpg", img, [int(cv.IMWRITE_JPEG_QUALITY), 85])
@@ -88,120 +87,147 @@ while True:
         if not ok:
             use_synthetic = True
             continue
+
     gray = cv.cvtColor(img, cv.COLOR_BGR2GRAY)
-    _ = run_feat(gray)
+    run_feat(gray)
+
     to_sleep = period - (time.time() - t0)
     if to_sleep > 0:
         time.sleep(to_sleep)
 PY
 
-### ====== logging_mapping.py 生成（定期クリーン入り） ======
-LOGMAP_PY="$(mktemp -p /tmp bg_logmap.XXXXXX.py)"
-cat > "$LOGMAP_PY" <<'PY'
+# ---- Generate logmap workload (I/O can be disabled) ----
+LOGMAP_PY="$(mktemp -p "${TMPDIR}" bg_logmap.XXXXXX.py)"
+cat > "${LOGMAP_PY}" <<'PY'
 import os, time, random
 import requests
 from pathlib import Path
 
-IO_DIR = Path(os.getenv("IO_DIR","/tmp/bg_io"))
-IO_DIR.mkdir(parents=True, exist_ok=True)
-TILE_URL = os.getenv("TILE_URL","https://tile.openstreetmap.org/10/550/340.png")
-TILE_PERIOD = float(os.getenv("TILE_PERIOD_SEC","7"))
-CLEAN_PERIOD = float(os.getenv("CLEAN_PERIOD_SEC","3600"))
+ENABLE_IO = os.getenv("LOGMAP_IO", "0") != "0"
+ENABLE_NET = os.getenv("LOGMAP_NET", "1") != "0"
+
+TILE_URL = os.getenv("TILE_URL", "https://tile.openstreetmap.org/10/550/340.png")
+TILE_PERIOD = float(os.getenv("TILE_PERIOD_SEC", "7"))
+CLEAN_PERIOD = float(os.getenv("CLEAN_PERIOD_SEC", "3600"))
+
+IO_DIR = None
+seq_path = None
+seq_file = None
+
+if ENABLE_IO:
+    IO_DIR = Path(os.getenv("IO_DIR", "/tmp/bg_io"))
+    IO_DIR.mkdir(parents=True, exist_ok=True)
+    seq_path = IO_DIR / "seq.bin"
+    seq_file = seq_path.open("ab", buffering=0)
 
 SIZES = [4*1024, 8*1024, 16*1024, 64*1024, 128*1024]
-SYNC_EVERY = 20
+SYNC_EVERY = 200
 
 wcount = 0
 last_tile = 0.0
 last_cleanup = time.time()
-seq_path = IO_DIR/"seq.bin"
-seq_file = seq_path.open("ab", buffering=0)
+
 
 def random_write():
     global wcount
     fname = IO_DIR / f"rnd_{random.randint(0,999999):06d}.bin"
     size = random.choice(SIZES)
-    data = os.urandom(size)
     with open(fname, "ab", buffering=0) as f:
-        f.write(data)
-        if random.random() < 0.3:
-            f.flush()
-            try:
-                with open(fname, "rb") as fr:
-                    fr.read(random.choice(SIZES))
-            except Exception:
-                pass
+        f.write(os.urandom(size))
     wcount += 1
-    if wcount % SYNC_EVERY == 0:
+    if seq_file is not None and (wcount % SYNC_EVERY == 0):
         try:
             os.fsync(seq_file.fileno())
         except Exception:
             pass
 
+
 def sequential_append():
-    size = random.choice(SIZES)
-    seq_file.write(os.urandom(size))
+    if seq_file is None:
+        return
+    seq_file.write(os.urandom(random.choice(SIZES)))
+
 
 def fetch_tile():
+    if not ENABLE_NET:
+        return
     try:
         r = requests.get(TILE_URL, timeout=3)
-        if r.ok:
-            (IO_DIR/"tile.cache").write_bytes(r.content)
+        if r.ok and ENABLE_IO and IO_DIR is not None:
+            (IO_DIR / "tile.cache").write_bytes(r.content)
     except Exception:
         pass
 
+
 def periodic_cleanup():
-    # rnd_*.bin を全削除し、seq.bin もリセット
+    global seq_file
+    if IO_DIR is None:
+        return
     for f in IO_DIR.glob("rnd_*.bin"):
         try:
             f.unlink()
         except Exception:
             pass
     try:
-        seq_file.close()
+        if seq_file is not None:
+            seq_file.close()
     except Exception:
         pass
     try:
-        if seq_path.exists():
+        if seq_path is not None and seq_path.exists():
             seq_path.unlink()
     except Exception:
         pass
-    # 再オープン
-    globals()['seq_file'] = seq_path.open("ab", buffering=0)
+    if seq_path is not None:
+        try:
+            seq_file = seq_path.open("ab", buffering=0)
+        except Exception:
+            seq_file = None
 
-t0 = time.time()
+
 while True:
     now = time.time()
-    random_write()
-    sequential_append()
 
-    if now - t0 > 0.2 and random.random() < 0.15:
+    if ENABLE_IO and IO_DIR is not None:
+        random_write()
+        sequential_append()
         time.sleep(0.02)
+    else:
+        time.sleep(0.05)
 
     if now - last_tile >= TILE_PERIOD:
         fetch_tile()
         last_tile = now
 
-    if now - last_cleanup >= CLEAN_PERIOD:
+    if ENABLE_IO and (now - last_cleanup >= CLEAN_PERIOD):
         periodic_cleanup()
         last_cleanup = time.time()
 PY
 
-### ====== 起動関数 ======
+# ---- Launch ----
 pids=()
 
+cleanup() {
+  echo "[bg] stopping..."
+  for pid in "${pids[@]:-}"; do
+    kill "$pid" 2>/dev/null || true
+  done
+  rm -f "${PERCEPTION_PY}" "${LOGMAP_PY}" 2>/dev/null || true
+}
+trap cleanup EXIT
+
 start_perception() {
-  echo "[bg] perception start on CPU $CPU_PERCEPTION"
-  taskset -c "$CPU_PERCEPTION" nice -n 10 "$PYTHON_BIN" "$PERCEPTION_PY" \
-    1>/tmp/bg_perception.out 2>&1 &
+  echo "[bg] perception start"
+  nice -n 10 "${PYTHON_BIN}" "${PERCEPTION_PY}" \
+    1>"${LOG_DIR}/bg_perception.out" 2>&1 &
   pids+=($!)
 }
 
 start_comms() {
-  echo "[bg] comms (iperf3 UDP bursts) start on CPU $CPU_COMMS"
-  taskset -c "$CPU_COMMS" nice -n 10 bash -c "
+  echo "[bg] comms (iperf3 UDP bursts) start"
+  nice -n 10 bash -lc "
     while true; do
-      iperf3 -u -c ${IPERF_SERVER} -b ${UPLOAD_MBIT}M -t ${BURST_SEC} -l 1200 >/tmp/bg_iperf3.out 2>&1 || true
+      iperf3 -u -c ${IPERF_SERVER} -b ${UPLOAD_MBIT}M -t ${BURST_SEC} -l 1200 >\"${LOG_DIR}/bg_iperf3.out\" 2>&1 || true
       sleep 0.2
     done
   " &
@@ -209,31 +235,19 @@ start_comms() {
 }
 
 start_logmap() {
-  echo "[bg] logging/mapping start on CPU $CPU_LOGMAP (cleanup every ${CLEAN_PERIOD_SEC}s)"
-  taskset -c "$CPU_LOGMAP" nice -n 10 "$PYTHON_BIN" "$LOGMAP_PY" \
-    1>/tmp/bg_logmap.out 2>&1 &
+  echo "[bg] logging/mapping start (LOGMAP_IO=${LOGMAP_IO}, LOGMAP_NET=${LOGMAP_NET})"
+  LOGMAP_IO="${LOGMAP_IO}" LOGMAP_NET="${LOGMAP_NET}" \
+  nice -n 10 "${PYTHON_BIN}" "${LOGMAP_PY}" \
+    1>"${LOG_DIR}/bg_logmap.out" 2>&1 &
   pids+=($!)
 }
-
-cleanup() {
-  echo "[bg] stopping..."
-  for pid in "${pids[@]:-}"; do
-    kill "$pid" 2>/dev/null || true
-  done
-  # 片付け（IO_DIR 中身を消す）
-  if [ -d "$IO_DIR" ]; then
-    find "$IO_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + 2>/dev/null || true
-  fi
-}
-trap cleanup EXIT
 
 start_perception
 start_comms
 start_logmap
 
-echo "[bg] all workloads launched."
+echo "[bg] all workloads launched (CPUQuota=20% when systemd-run is available)."
 echo "[bg] PIDs: ${pids[*]}"
-echo "[bg] logs: /tmp/bg_perception.out , /tmp/bg_iperf3.out , /tmp/bg_logmap.out"
+echo "[bg] logs: ${LOG_DIR}/bg_perception.out , ${LOG_DIR}/bg_iperf3.out , ${LOG_DIR}/bg_logmap.out"
 
-# フォアグラウンドで待つ（Ctrl-C で終了とクリーンアップ）
 wait
