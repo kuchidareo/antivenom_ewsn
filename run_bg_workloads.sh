@@ -1,253 +1,224 @@
-#!/usr/bin/env bash
-# Background workloads (Perception / Comms / LogMap)
-# Always run under systemd CPUQuota=20% (when systemd-run is available).
 
+
+#!/usr/bin/env bash
 set -euo pipefail
 
-# ---- Force CPU quota (20%) via systemd-run scope ----
-if [ "${BG_CPUQUOTA_WRAPPED:-0}" != "1" ]; then
-  if command -v systemd-run >/dev/null 2>&1; then
-    # Quote args safely for bash -lc
-    qargs=()
-    for a in "$@"; do
-      qargs+=("$(printf '%q' "$a")")
-    done
-    self_q="$(printf '%q' "$0")"
-    exec systemd-run --scope -p CPUQuota=20% bash -lc "BG_CPUQUOTA_WRAPPED=1 ${self_q} ${qargs[*]}"
+# Background workload: fixed ON duration + random OFF duration.
+# Designed to create a bimodal background load (idle vs batch) for OT experiments.
+
+ON_SEC=${ON_SEC:-10}
+OFF_MIN_SEC=${OFF_MIN_SEC:-20}
+OFF_MAX_SEC=${OFF_MAX_SEC:-60}
+MODE=${MODE:-cpu}           # cpu | mem | io
+THREADS=${THREADS:-0}
+RUN_FOR_SEC=${RUN_FOR_SEC:-0}  # 0 = forever
+WARMUP_SEC=${WARMUP_SEC:-2}    # seconds to skip at start of each ON window (transient)
+
+usage() {
+  cat <<EOF
+Usage: $(basename "$0") [--on SEC] [--off-min SEC] [--off-max SEC] [--mode cpu|mem|io] [--threads N] [--run-for SEC] [--warmup SEC]
+
+Env vars (override defaults):
+  ON_SEC=$ON_SEC
+  OFF_MIN_SEC=$OFF_MIN_SEC
+  OFF_MAX_SEC=$OFF_MAX_SEC
+  MODE=$MODE
+  THREADS=$THREADS
+  RUN_FOR_SEC=$RUN_FOR_SEC
+  WARMUP_SEC=$WARMUP_SEC
+
+Examples:
+  MODE=cpu ON_SEC=10 OFF_MIN_SEC=20 OFF_MAX_SEC=60 ./run_bg_workloads.sh
+  ./run_bg_workloads.sh --mode io --on 10 --off-min 10 --off-max 30 --run-for 600
+EOF
+}
+
+# --- arg parsing ---
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --on) ON_SEC="$2"; shift 2;;
+    --off-min) OFF_MIN_SEC="$2"; shift 2;;
+    --off-max) OFF_MAX_SEC="$2"; shift 2;;
+    --mode) MODE="$2"; shift 2;;
+    --threads) THREADS="$2"; shift 2;;
+    --run-for) RUN_FOR_SEC="$2"; shift 2;;
+    --warmup) WARMUP_SEC="$2"; shift 2;;
+    -h|--help) usage; exit 0;;
+    *) echo "Unknown arg: $1"; usage; exit 1;;
+  esac
+done
+
+if [[ "$OFF_MIN_SEC" -gt "$OFF_MAX_SEC" ]]; then
+  echo "OFF_MIN_SEC must be <= OFF_MAX_SEC" >&2
+  exit 1
+fi
+
+# Determine thread count
+if [[ "$THREADS" -le 0 ]]; then
+  if command -v nproc >/dev/null 2>&1; then
+    THREADS=$(nproc)
+  elif command -v sysctl >/dev/null 2>&1; then
+    THREADS=$(sysctl -n hw.ncpu 2>/dev/null || echo 1)
   else
-    echo "[bg] WARNING: systemd-run not found; running without CPUQuota" >&2
+    THREADS=1
   fi
 fi
 
-# ---- tmpfs preferred (avoid SD/eMMC writes) ----
-TMPDIR_DEFAULT="/dev/shm"
-if [ -d "${TMPDIR_DEFAULT}" ] && [ -w "${TMPDIR_DEFAULT}" ]; then
-  TMPDIR="${TMPDIR_DEFAULT}"
-else
-  TMPDIR="/tmp"
-fi
-LOG_DIR="${TMPDIR}"
+now_ts() { date -u "+%Y-%m-%dT%H:%M:%SZ"; }
 
-# ---- Settings ----
-FEATURE="${FEATURE:-fast}"          # fast / orb
-CAM_INDEX="${CAM_INDEX:-0}"
-TARGET_FPS="${TARGET_FPS:-10}"
-
-IPERF_SERVER="${IPERF_SERVER:-192.0.2.10}"  # replace with real iperf3 server
-UPLOAD_MBIT="${UPLOAD_MBIT:-2}"
-BURST_SEC="${BURST_SEC:-1}"
-
-IO_DIR="${IO_DIR:-${TMPDIR}/bg_io}"
-TILE_URL="${TILE_URL:-https://tile.openstreetmap.org/10/550/340.png}"
-TILE_PERIOD_SEC="${TILE_PERIOD_SEC:-7}"
-CLEAN_PERIOD_SEC="${CLEAN_PERIOD_SEC:-3600}"
-
-# LogMap defaults: run, but no disk I/O (SD/eMMC protection)
-LOGMAP_IO=0
-LOGMAP_NET=1
-
-PYTHON_BIN="${PYTHON_BIN:-/usr/bin/python3}"
-
-# ---- Generate perception workload ----
-PERCEPTION_PY="$(mktemp -p "${TMPDIR}" bg_perception.XXXXXX.py)"
-cat > "${PERCEPTION_PY}" <<'PY'
-import os, time
-import numpy as np
-import cv2 as cv
-
-FEATURE = os.getenv("FEATURE","fast").lower()
-CAM_INDEX = int(os.getenv("CAM_INDEX","0"))
-TARGET_FPS = float(os.getenv("TARGET_FPS","10"))
-period = 1.0 / max(TARGET_FPS, 0.1)
-
-cap = cv.VideoCapture(CAM_INDEX)
-use_synthetic = not cap.isOpened()
-if use_synthetic:
-    w,h = 640,480
-    frame = (np.random.rand(h,w,3)*255).astype(np.uint8)
-
-if FEATURE == "orb":
-    det = cv.ORB_create(nfeatures=500)
-    def run_feat(img):
-        det.detectAndCompute(img, None)
-else:
-    det = cv.FastFeatureDetector_create(threshold=20, nonmaxSuppression=True)
-    def run_feat(img):
-        det.detect(img, None)
-
-while True:
-    t0 = time.time()
-
-    if use_synthetic:
-        img = frame
-        _, buf = cv.imencode(".jpg", img, [int(cv.IMWRITE_JPEG_QUALITY), 85])
-        img = cv.imdecode(buf, cv.IMREAD_COLOR)
-    else:
-        ok, img = cap.read()
-        if not ok:
-            use_synthetic = True
-            continue
-
-    gray = cv.cvtColor(img, cv.COLOR_BGR2GRAY)
-    run_feat(gray)
-
-    to_sleep = period - (time.time() - t0)
-    if to_sleep > 0:
-        time.sleep(to_sleep)
+rand_int() {
+  # Inclusive random integer in [min, max]
+  local min="$1" max="$2"
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - <<PY
+import random
+print(random.randint(int("$min"), int("$max")))
 PY
+  else
+    # $RANDOM is 0..32767; scale to range
+    local r=$RANDOM
+    echo $(( min + (r % (max - min + 1)) ))
+  fi
+}
 
-# ---- Generate logmap workload (I/O can be disabled) ----
-LOGMAP_PY="$(mktemp -p "${TMPDIR}" bg_logmap.XXXXXX.py)"
-cat > "${LOGMAP_PY}" <<'PY'
-import os, time, random
-import requests
-from pathlib import Path
-
-ENABLE_IO = os.getenv("LOGMAP_IO", "0") != "0"
-ENABLE_NET = os.getenv("LOGMAP_NET", "1") != "0"
-
-TILE_URL = os.getenv("TILE_URL", "https://tile.openstreetmap.org/10/550/340.png")
-TILE_PERIOD = float(os.getenv("TILE_PERIOD_SEC", "7"))
-CLEAN_PERIOD = float(os.getenv("CLEAN_PERIOD_SEC", "3600"))
-
-IO_DIR = None
-seq_path = None
-seq_file = None
-
-if ENABLE_IO:
-    IO_DIR = Path(os.getenv("IO_DIR", "/tmp/bg_io"))
-    IO_DIR.mkdir(parents=True, exist_ok=True)
-    seq_path = IO_DIR / "seq.bin"
-    seq_file = seq_path.open("ab", buffering=0)
-
-SIZES = [4*1024, 8*1024, 16*1024, 64*1024, 128*1024]
-SYNC_EVERY = 200
-
-wcount = 0
-last_tile = 0.0
-last_cleanup = time.time()
-
-
-def random_write():
-    global wcount
-    fname = IO_DIR / f"rnd_{random.randint(0,999999):06d}.bin"
-    size = random.choice(SIZES)
-    with open(fname, "ab", buffering=0) as f:
-        f.write(os.urandom(size))
-    wcount += 1
-    if seq_file is not None and (wcount % SYNC_EVERY == 0):
-        try:
-            os.fsync(seq_file.fileno())
-        except Exception:
-            pass
-
-
-def sequential_append():
-    if seq_file is None:
-        return
-    seq_file.write(os.urandom(random.choice(SIZES)))
-
-
-def fetch_tile():
-    if not ENABLE_NET:
-        return
-    try:
-        r = requests.get(TILE_URL, timeout=3)
-        if r.ok and ENABLE_IO and IO_DIR is not None:
-            (IO_DIR / "tile.cache").write_bytes(r.content)
-    except Exception:
-        pass
-
-
-def periodic_cleanup():
-    global seq_file
-    if IO_DIR is None:
-        return
-    for f in IO_DIR.glob("rnd_*.bin"):
-        try:
-            f.unlink()
-        except Exception:
-            pass
-    try:
-        if seq_file is not None:
-            seq_file.close()
-    except Exception:
-        pass
-    try:
-        if seq_path is not None and seq_path.exists():
-            seq_path.unlink()
-    except Exception:
-        pass
-    if seq_path is not None:
-        try:
-            seq_file = seq_path.open("ab", buffering=0)
-        except Exception:
-            seq_file = None
-
-
-while True:
-    now = time.time()
-
-    if ENABLE_IO and IO_DIR is not None:
-        random_write()
-        sequential_append()
-        time.sleep(0.02)
-    else:
-        time.sleep(0.05)
-
-    if now - last_tile >= TILE_PERIOD:
-        fetch_tile()
-        last_tile = now
-
-    if ENABLE_IO and (now - last_cleanup >= CLEAN_PERIOD):
-        periodic_cleanup()
-        last_cleanup = time.time()
-PY
-
-# ---- Launch ----
-pids=()
-
+PIDS=()
 cleanup() {
-  echo "[bg] stopping..."
-  for pid in "${pids[@]:-}"; do
-    kill "$pid" 2>/dev/null || true
-  done
-  rm -f "${PERCEPTION_PY}" "${LOGMAP_PY}" 2>/dev/null || true
-}
-trap cleanup EXIT
-
-start_perception() {
-  echo "[bg] perception start"
-  nice -n 10 "${PYTHON_BIN}" "${PERCEPTION_PY}" \
-    1>"${LOG_DIR}/bg_perception.out" 2>&1 &
-  pids+=($!)
-}
-
-start_comms() {
-  echo "[bg] comms (iperf3 UDP bursts) start"
-  nice -n 10 bash -lc "
-    while true; do
-      iperf3 -u -c ${IPERF_SERVER} -b ${UPLOAD_MBIT}M -t ${BURST_SEC} -l 1200 >\"${LOG_DIR}/bg_iperf3.out\" 2>&1 || true
-      sleep 0.2
+  # Kill any running workers
+  if [[ ${#PIDS[@]} -gt 0 ]]; then
+    for pid in "${PIDS[@]}"; do
+      kill "$pid" >/dev/null 2>&1 || true
     done
-  " &
-  pids+=($!)
+    # Give them a moment, then force
+    sleep 0.2 || true
+    for pid in "${PIDS[@]}"; do
+      kill -9 "$pid" >/dev/null 2>&1 || true
+    done
+  fi
+  PIDS=()
+}
+trap cleanup EXIT INT TERM
+
+# --- workload workers ---
+start_cpu_workers() {
+  # Prefer openssl if available (good CPU burn)
+  if command -v openssl >/dev/null 2>&1; then
+    # Each worker burns CPU via openssl speed; redirect output.
+    for _ in $(seq 1 "$THREADS"); do
+      (openssl speed -seconds 60 sha256 >/dev/null 2>&1) &
+      PIDS+=("$!")
+    done
+    return
+  fi
+
+  # Fallback: stream zeros and checksum (usually available)
+  if command -v cksum >/dev/null 2>&1; then
+    for _ in $(seq 1 "$THREADS"); do
+      (while :; do dd if=/dev/zero bs=1m count=32 2>/dev/null | cksum >/dev/null; done) &
+      PIDS+=("$!")
+    done
+    return
+  fi
+
+  if command -v shasum >/dev/null 2>&1; then
+    for _ in $(seq 1 "$THREADS"); do
+      (while :; do dd if=/dev/zero bs=1m count=16 2>/dev/null | shasum >/dev/null; done) &
+      PIDS+=("$!")
+    done
+    return
+  fi
+
+  # Last resort: pure bash arithmetic loop
+  for _ in $(seq 1 "$THREADS"); do
+    (x=0; while :; do x=$(( (x + 1103515245) ^ 12345 )); done) &
+    PIDS+=("$!")
+  done
 }
 
-start_logmap() {
-  echo "[bg] logging/mapping start (LOGMAP_IO=${LOGMAP_IO}, LOGMAP_NET=${LOGMAP_NET})"
-  LOGMAP_IO="${LOGMAP_IO}" LOGMAP_NET="${LOGMAP_NET}" \
-  nice -n 10 "${PYTHON_BIN}" "${LOGMAP_PY}" \
-    1>"${LOG_DIR}/bg_logmap.out" 2>&1 &
-  pids+=($!)
+start_mem_workers() {
+  # Allocate memory for the ON window; do it in separate processes.
+  # Prefer python (most controllable). Allocate ~256MB per worker by default.
+  local per_mb=${MEM_MB_PER_WORKER:-256}
+  if command -v python3 >/dev/null 2>&1; then
+    for _ in $(seq 1 "$THREADS"); do
+      (python3 - <<PY
+import os, time
+mb = int(os.environ.get('MEM_MB_PER_WORKER', '$per_mb'))
+# Allocate and touch memory to force commit
+b = bytearray(mb * 1024 * 1024)
+for i in range(0, len(b), 4096):
+    b[i] = 1
+time.sleep(10**9)
+PY
+      ) &
+      PIDS+=("$!")
+    done
+    return
+  fi
+
+  # Fallback: write big temp files to tmpfs or /tmp (page cache pressure)
+  local dir=/tmp
+  [[ -d /dev/shm ]] && dir=/dev/shm
+  for i in $(seq 1 "$THREADS"); do
+    local f="$dir/bg_mem_${$}_$i.bin"
+    (dd if=/dev/zero of="$f" bs=1m count="$per_mb" conv=fsync 2>/dev/null; tail -f /dev/null >/dev/null) &
+    PIDS+=("$!")
+  done
 }
 
-start_perception
-start_comms
-start_logmap
+start_io_workers() {
+  local dir=/tmp
+  [[ -d /dev/shm ]] && dir=/dev/shm
+  local mb=${IO_MB:-512}
+  for i in $(seq 1 "$THREADS"); do
+    local f="$dir/bg_io_${$}_$i.bin"
+    (while :; do
+        dd if=/dev/zero of="$f" bs=1m count="$mb" conv=fsync 2>/dev/null
+        dd if="$f" of=/dev/null bs=1m 2>/dev/null
+        rm -f "$f"
+      done) &
+    PIDS+=("$!")
+  done
+}
 
-echo "[bg] all workloads launched (CPUQuota=20% when systemd-run is available)."
-echo "[bg] PIDs: ${pids[*]}"
-echo "[bg] logs: ${LOG_DIR}/bg_perception.out , ${LOG_DIR}/bg_iperf3.out , ${LOG_DIR}/bg_logmap.out"
+start_workers() {
+  cleanup
+  case "$MODE" in
+    cpu) start_cpu_workers;;
+    mem) start_mem_workers;;
+    io)  start_io_workers;;
+    *) echo "Unknown MODE: $MODE (expected cpu|mem|io)" >&2; exit 1;;
+  esac
+}
 
-wait
+# --- main loop ---
+start_time=$(date +%s)
+cycle=0
+while :; do
+  cycle=$((cycle + 1))
+  off=$(rand_int "$OFF_MIN_SEC" "$OFF_MAX_SEC")
+
+  echo "[$(now_ts)] cycle=$cycle OFF ${off}s (mode=$MODE threads=$THREADS)"
+  sleep "$off"
+
+  echo "[$(now_ts)] cycle=$cycle ON  ${ON_SEC}s (warmup=${WARMUP_SEC}s)"
+  start_workers
+  # Let the load stabilize
+  if [[ "$WARMUP_SEC" -gt 0 ]]; then
+    sleep "$WARMUP_SEC"
+  fi
+  # Keep workers running for the remainder of ON
+  remain=$(( ON_SEC - WARMUP_SEC ))
+  if [[ "$remain" -gt 0 ]]; then
+    sleep "$remain"
+  fi
+  cleanup
+
+  if [[ "$RUN_FOR_SEC" -gt 0 ]]; then
+    now=$(date +%s)
+    if [[ $((now - start_time)) -ge "$RUN_FOR_SEC" ]]; then
+      echo "[$(now_ts)] finished after ${RUN_FOR_SEC}s"
+      exit 0
+    fi
+  fi
+
+done
