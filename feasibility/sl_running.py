@@ -1,0 +1,1158 @@
+
+
+"""Train a simple CNN on TrashNet (HF) with optional poisoning variants.
+
+Data
+- Clean data is loaded directly from Hugging Face dataset `kuchidareo/trashnet_small`.
+- Poisoned data is loaded from the output of `data_preparing.py`, under:
+    <data_root>/blurring/
+    <data_root>/occlusion/
+    <data_root>/label-flip/
+  Each has JPEGs + metadata.jsonl.
+
+Poisoning usage
+- Choose one of: none | blurring | occlusion | label-flip
+- Training dataset becomes: clean_train + sampled(poison_train, poison_frac)
+  (i.e., concatenate clean + poison samples)
+
+Logging (important)
+- Writes ONE timestamped CSV: <log_dir>/<YYYYmmdd_HHMMSS>.csv
+- Logs at 1 FPS by default.
+- Captures system metrics via psutil (CPU, mem, process usage, IO, net).
+- Best-effort CPU temperature (if available).
+- Training loop marks train_start/train_end events and only logs while training
+  (logger disabled during evaluation by default).
+
+This file is designed to be extended heavily later.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import datetime as dt
+import json
+import os
+import platform
+import random
+import subprocess
+import threading
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+
+# Torch deps
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import ConcatDataset, DataLoader, Dataset
+
+# HF deps
+from datasets import ClassLabel, Dataset as HFDataset, DatasetDict, Image as HFImage, load_dataset
+
+# Image deps
+from PIL import Image
+
+# System metrics
+import psutil
+from tqdm import tqdm
+
+
+# =============================
+# Utilities: dataset schema detection
+# =============================
+
+
+def _find_image_column(features: Dict[str, Any]) -> str:
+    if "image" in features and isinstance(features["image"], HFImage):
+        return "image"
+    for k, v in features.items():
+        if isinstance(v, HFImage):
+            return k
+    raise ValueError("Could not find an image column (datasets.Image).")
+
+
+def _find_label_column(features: Dict[str, Any]) -> str:
+    if "label" in features:
+        return "label"
+    for k, v in features.items():
+        if isinstance(v, ClassLabel):
+            return k
+    for candidate in ("labels", "category", "class", "target"):
+        if candidate in features:
+            return candidate
+    raise ValueError("Could not find a label column.")
+
+
+def _get_class_names(ds: HFDataset, label_col: str) -> Optional[List[str]]:
+    feat = ds.features.get(label_col)
+    if isinstance(feat, ClassLabel):
+        return list(feat.names)
+    return None
+
+
+# =============================
+# Transforms (minimal, no torchvision dependency)
+# =============================
+
+
+def pil_to_tensor(img: Image.Image) -> torch.Tensor:
+    # Convert PIL RGB to float tensor in [0,1], shape (C,H,W)
+    arr = np.array(img, dtype=np.float32) / 255.0
+    if arr.ndim == 2:
+        arr = np.stack([arr, arr, arr], axis=-1)
+    if arr.shape[2] == 4:
+        arr = arr[:, :, :3]
+    t = torch.from_numpy(arr).permute(2, 0, 1).contiguous()
+    return t
+
+
+def resize_pil(img: Image.Image, size: int) -> Image.Image:
+    return img.resize((size, size), resample=Image.BILINEAR)
+
+
+def normalize_tensor(x: torch.Tensor, mode: str) -> torch.Tensor:
+    # x in [0,1]
+    if mode == "none":
+        return x
+    if mode == "imagenet":
+        mean = torch.tensor([0.485, 0.456, 0.406], dtype=x.dtype, device=x.device)[:, None, None]
+        std = torch.tensor([0.229, 0.224, 0.225], dtype=x.dtype, device=x.device)[:, None, None]
+        return (x - mean) / std
+    # default: center to [-1,1] with mean=0.5 std=0.5
+    mean = torch.tensor([0.5, 0.5, 0.5], dtype=x.dtype, device=x.device)[:, None, None]
+    std = torch.tensor([0.5, 0.5, 0.5], dtype=x.dtype, device=x.device)[:, None, None]
+    return (x - mean) / std
+
+
+@dataclass(frozen=True)
+class TransformConfig:
+    img_size: int
+    normalize: str = "0.5"  # one of: none | 0.5 | imagenet
+
+
+def apply_transform(img: Image.Image, cfg: TransformConfig) -> torch.Tensor:
+    img = img.convert("RGB")
+    img = resize_pil(img, cfg.img_size)
+    x = pil_to_tensor(img)
+    x = normalize_tensor(x, "imagenet" if cfg.normalize == "imagenet" else ("none" if cfg.normalize == "none" else "0.5"))
+    return x
+
+
+# =============================
+# Datasets
+# =============================
+
+
+class CleanHFDataset(Dataset):
+    def __init__(
+        self,
+        ds: HFDataset,
+        image_col: str,
+        label_col: str,
+        tfm_cfg: TransformConfig,
+    ) -> None:
+        self.ds = ds
+        self.image_col = image_col
+        self.label_col = label_col
+        self.tfm_cfg = tfm_cfg
+
+    def __len__(self) -> int:
+        return len(self.ds)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
+        ex = self.ds[idx]
+        img_any = ex[self.image_col]
+        if isinstance(img_any, dict) and "image" in img_any:
+            img = img_any["image"]
+        else:
+            img = img_any
+        if not isinstance(img, Image.Image):
+            raise TypeError(f"Expected PIL.Image.Image, got {type(img)}")
+
+        x = apply_transform(img, self.tfm_cfg)
+        y = int(ex[self.label_col])
+        return x, y
+
+
+class PoisonDiskDataset(Dataset):
+    """Loads poisoned samples from <variant>/metadata.jsonl and JPEGs.
+
+    Notes
+    - Filenames created by data_preparing.py include split prefix: <split>_<hash>.jpg
+    - We filter rows by that prefix.
+    """
+
+    def __init__(
+        self,
+        variant_dir: Path,
+        split_name: str,
+        tfm_cfg: TransformConfig,
+    ) -> None:
+        self.variant_dir = variant_dir
+        self.split_name = split_name
+        self.tfm_cfg = tfm_cfg
+
+        meta_path = self.variant_dir / "metadata.jsonl"
+        if not meta_path.exists():
+            raise FileNotFoundError(f"metadata.jsonl not found: {meta_path}")
+
+        items: List[Tuple[str, int]] = []
+        with open(meta_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                rec = json.loads(line)
+                fname = rec["file"]
+                if not fname.startswith(f"{split_name}_"):
+                    continue
+                items.append((fname, int(rec["label"])))
+
+        if not items:
+            raise RuntimeError(f"No items found for split='{split_name}' in {meta_path}")
+
+        self.items = items
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
+        fname, y = self.items[idx]
+        img_path = self.variant_dir / fname
+        img = Image.open(img_path)
+        x = apply_transform(img, self.tfm_cfg)
+        return x, y
+
+
+def sample_poison_dataset(poison_ds: Dataset, poison_frac: float, seed: int) -> Dataset:
+    if poison_frac <= 0:
+        return torch.utils.data.Subset(poison_ds, [])
+    if poison_frac >= 1:
+        return poison_ds
+
+    n = len(poison_ds)
+    k = max(1, int(n * poison_frac))
+    rng = random.Random(seed)
+    idxs = list(range(n))
+    rng.shuffle(idxs)
+    idxs = idxs[:k]
+    return torch.utils.data.Subset(poison_ds, idxs)
+
+
+def subsample_dataset(ds: Dataset, frac: float, seed: int) -> Dataset:
+    if frac >= 1.0:
+        return ds
+    if frac <= 0:
+        return torch.utils.data.Subset(ds, [])
+    n = len(ds)
+    k = max(1, int(n * frac))
+    rng = random.Random(seed)
+    idxs = list(range(n))
+    rng.shuffle(idxs)
+    idxs = idxs[:k]
+    return torch.utils.data.Subset(ds, idxs)
+
+
+def sample_n_dataset(ds: Dataset, n: int, seed: int) -> Dataset:
+    if n <= 0:
+        return torch.utils.data.Subset(ds, [])
+    total = len(ds)
+    if n >= total:
+        return ds
+    rng = random.Random(seed)
+    idxs = list(range(total))
+    rng.shuffle(idxs)
+    idxs = idxs[:n]
+    return torch.utils.data.Subset(ds, idxs)
+
+
+# =============================
+# Model: simple CNN (3 conv, 3 fc)
+# =============================
+
+
+class SimpleCNN(nn.Module):
+    def __init__(self, n_classes: int, img_size: int) -> None:
+        super().__init__()
+
+        # 3 conv layers
+        self.conv1 = nn.Conv2d(3, 32, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
+        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
+
+        self.pool = nn.MaxPool2d(2, 2)
+
+        # Determine feature dim dynamically
+        with torch.no_grad():
+            dummy = torch.zeros(1, 3, img_size, img_size)
+            feats = self._forward_features(dummy)
+            feat_dim = int(feats.view(1, -1).shape[1])
+
+        # 3 fc layers
+        self.fc1 = nn.Linear(feat_dim, 256)
+        self.fc2 = nn.Linear(256, 128)
+        self.fc3 = nn.Linear(128, n_classes)
+
+    def _forward_features(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.pool(F.relu(self.conv1(x)))
+        x = self.pool(F.relu(self.conv2(x)))
+        x = self.pool(F.relu(self.conv3(x)))
+        return x
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self._forward_features(x)
+        x = torch.flatten(x, 1)
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        x = self.fc3(x)
+        return x
+
+
+# =============================
+# Split learning models (client/server)
+# =============================
+
+
+class ClientTrashNet(nn.Module):
+    """Client-side CNN: 6 conv layers (feature extractor)."""
+
+    def __init__(self, img_size: int) -> None:
+        super().__init__()
+        self.leaky_relu = nn.LeakyReLU()
+
+        self.conv1 = nn.Conv2d(3, 32, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
+        self.pool1 = nn.MaxPool2d(2, 2)
+
+        self.conv3 = nn.Conv2d(64, 64, kernel_size=3, padding=1)
+        self.conv4 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
+        self.pool2 = nn.MaxPool2d(2, 2)
+
+        self.conv5 = nn.Conv2d(128, 128, kernel_size=3, padding=1)
+        self.conv6 = nn.Conv2d(128, 32, kernel_size=3, padding=1)
+        self.pool3 = nn.MaxPool2d(2, 2)
+
+        self.flatten = nn.Flatten()
+
+        with torch.no_grad():
+            dummy = torch.zeros(1, 3, img_size, img_size)
+            feats = self._forward_features(dummy)
+            self._feature_dim = int(feats.view(1, -1).shape[1])
+
+    @property
+    def feature_dim(self) -> int:
+        return self._feature_dim
+
+    def _forward_features(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.leaky_relu(self.conv1(x))
+        x = self.leaky_relu(self.conv2(x))
+        x = self.pool1(x)
+
+        x = self.leaky_relu(self.conv3(x))
+        x = self.leaky_relu(self.conv4(x))
+        x = self.pool2(x)
+
+        x = self.leaky_relu(self.conv5(x))
+        x = self.leaky_relu(self.conv6(x))
+        x = self.pool3(x)
+        return x
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self._forward_features(x)
+        x = self.flatten(x)
+        return x
+
+
+class ServerTrashNet(nn.Module):
+    """Server-side MLP: 3 fc layers."""
+
+    def __init__(self, feature_dim: int, n_classes: int = 6) -> None:
+        super().__init__()
+        self.fc1 = nn.Linear(feature_dim, 64)
+        self.dropout1 = nn.Dropout(0.2)
+        self.fc2 = nn.Linear(64, 32)
+        self.dropout2 = nn.Dropout(0.2)
+        self.fc3 = nn.Linear(32, n_classes)
+        self.leaky_relu = nn.LeakyReLU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.leaky_relu(self.fc1(x))
+        x = self.dropout1(x)
+        x = self.leaky_relu(self.fc2(x))
+        x = self.dropout2(x)
+        x = self.fc3(x)
+        return x
+
+
+# =============================
+# Logger: 1 FPS system + training state to one CSV
+# =============================
+
+
+class MetricsCollector:
+    def collect(self) -> Dict[str, Any]:
+        raise NotImplementedError
+
+
+class SystemCollector(MetricsCollector):
+    def __init__(self, proc: psutil.Process) -> None:
+        self.proc = proc
+        self._last_disk = None
+        self._last_ts = None
+
+        # warm-up for cpu_percent
+        psutil.cpu_percent(interval=None)
+        self.proc.cpu_percent(interval=None)
+
+    @staticmethod
+    def _cpu_temperature_c() -> Optional[float]:
+        # Best-effort: Linux via psutil or /sys; other OS may return None.
+        try:
+            temps = psutil.sensors_temperatures(fahrenheit=False)  # type: ignore[attr-defined]
+            if temps:
+                # Prefer common keys
+                for key in ("coretemp", "k10temp", "cpu_thermal", "soc_thermal"):
+                    if key in temps and temps[key]:
+                        vals = [t.current for t in temps[key] if t.current is not None]
+                        if vals:
+                            return float(np.mean(vals))
+                # Fallback: first available
+                for entries in temps.values():
+                    vals = [t.current for t in entries if t.current is not None]
+                    if vals:
+                        return float(np.mean(vals))
+        except Exception:
+            pass
+
+        # /sys fallback
+        try:
+            base = Path("/sys/class/thermal")
+            if base.exists():
+                temps = []
+                for p in base.glob("thermal_zone*/temp"):
+                    try:
+                        raw = p.read_text().strip()
+                        if raw:
+                            v = float(raw)
+                            # Often millidegrees
+                            if v > 1000:
+                                v = v / 1000.0
+                            temps.append(v)
+                    except Exception:
+                        continue
+                if temps:
+                    return float(np.mean(temps))
+        except Exception:
+            pass
+
+        return None
+
+    def collect(self) -> Dict[str, Any]:
+        now = dt.datetime.now(dt.timezone.utc)
+        now_ts = now.timestamp()
+
+        # CPU
+        cpu_total = psutil.cpu_percent(interval=None)
+        cpu_per_core = psutil.cpu_percent(interval=None, percpu=True)
+
+        # Memory
+        vm = psutil.virtual_memory()
+        sm = psutil.swap_memory()
+
+        # Process
+        p_cpu = self.proc.cpu_percent(interval=None)
+        try:
+            p_mem = self.proc.memory_info().rss
+        except Exception:
+            p_mem = None
+
+        temp_c = self._cpu_temperature_c()
+
+        # Disk IO (system-wide counters)
+        disk = psutil.disk_io_counters()
+        if disk is not None:
+            read_bytes = disk.read_bytes
+            write_bytes = disk.write_bytes
+            read_count = disk.read_count
+            write_count = disk.write_count
+        else:
+            read_bytes = write_bytes = read_count = write_count = None
+
+        # Deltas since last sample
+        if self._last_disk is not None and self._last_ts is not None and disk is not None:
+            dt_sec = max(now_ts - self._last_ts, 1e-6)
+            read_bytes_delta = read_bytes - self._last_disk.read_bytes
+            write_bytes_delta = write_bytes - self._last_disk.write_bytes
+            read_bps = read_bytes_delta / dt_sec
+            write_bps = write_bytes_delta / dt_sec
+        else:
+            read_bytes_delta = write_bytes_delta = None
+            read_bps = write_bps = None
+
+        self._last_disk = disk
+        self._last_ts = now_ts
+
+        out: Dict[str, Any] = {
+            "ts_iso": now.isoformat(),
+            "ts_unix": now_ts,
+            "cpu_percent": cpu_total,
+            "cpu_per_core": json.dumps(cpu_per_core),
+            "mem_percent": vm.percent,
+            "swap_percent": sm.percent,
+            "proc_cpu_percent": p_cpu,
+            "proc_rss": p_mem,
+            "cpu_temp_c": temp_c,
+            "disk_read_bytes": read_bytes,
+            "disk_write_bytes": write_bytes,
+            "disk_read_count": read_count,
+            "disk_write_count": write_count,
+            "disk_read_bytes_delta": read_bytes_delta,
+            "disk_write_bytes_delta": write_bytes_delta,
+            "disk_read_bps": read_bps,
+            "disk_write_bps": write_bps,
+        }
+
+        return out
+
+
+class CSVRunLogger:
+    """One-file CSV logger with a 1 FPS background loop.
+
+    - When disabled, does not write periodic rows.
+    - You can still emit event rows via mark_event().
+    - Training loop can update `state` (epoch/step/loss/etc.) and it will be included.
+
+    Extensible: add more collectors later.
+    """
+
+    def __init__(self, out_csv: Path, fps: float = 1.0, collectors: Optional[List[MetricsCollector]] = None) -> None:
+        self.out_csv = out_csv
+        self.fps = fps
+        self.collectors = collectors or []
+
+        self._enabled = False
+        self._stop = False
+        self._thread: Optional[threading.Thread] = None
+
+        self._state_lock = threading.Lock()
+        self._state: Dict[str, Any] = {
+            "phase": "idle",
+            "train_active": 0,
+            "event": "",
+            "epoch": None,
+            "step": None,
+            "global_step": None,
+            "loss": None,
+            "lr": None,
+            "acc": None,
+        }
+
+        self._header_written = False
+        self.out_csv.parent.mkdir(parents=True, exist_ok=True)
+
+    def update_state(self, **kwargs: Any) -> None:
+        with self._state_lock:
+            self._state.update(kwargs)
+
+    def enable(self) -> None:
+        self._enabled = True
+        self.update_state(train_active=1, phase="train")
+
+    def disable(self) -> None:
+        self._enabled = False
+        self.update_state(train_active=0, phase="idle")
+
+    def mark_event(self, name: str) -> None:
+        # Emit an immediate row containing an event marker.
+        self._write_row(event=name)
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._stop = False
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop = True
+        if self._thread is not None:
+            self._thread.join(timeout=5.0)
+        self._thread = None
+
+    def _loop(self) -> None:
+        period = 1.0 / max(0.1, float(self.fps))
+        next_t = time.time()
+        while not self._stop:
+            now = time.time()
+            if now >= next_t:
+                next_t = now + period
+                if self._enabled:
+                    self._write_row()
+            time.sleep(0.01)
+
+    def _collect_all(self) -> Dict[str, Any]:
+        row: Dict[str, Any] = {}
+        for c in self.collectors:
+            try:
+                row.update(c.collect())
+            except Exception as e:
+                row["collector_error"] = f"{type(e).__name__}: {e}"
+        with self._state_lock:
+            row.update(self._state)
+        return row
+
+    def _write_row(self, **override: Any) -> None:
+        row = self._collect_all()
+        if override:
+            row.update(override)
+
+        # Write header lazily (union of keys encountered).
+        # To keep it extensible, we maintain a growing header by rewriting nothing;
+        # instead, we write with a stable superset header computed at first write.
+        # If you add new keys later, extend this by storing header state.
+        if not self._header_written:
+            self._header = sorted(row.keys())  # type: ignore[attr-defined]
+            with open(self.out_csv, "w", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=self._header, extrasaction="ignore")
+                w.writeheader()
+                w.writerow({k: row.get(k, "") for k in self._header})
+            self._header_written = True
+            return
+
+        # Append
+        with open(self.out_csv, "a", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=self._header, extrasaction="ignore")  # type: ignore[attr-defined]
+            w.writerow({k: row.get(k, "") for k in self._header})
+
+
+# =============================
+# Training / eval
+# =============================
+
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+@torch.no_grad()
+def evaluate_split(
+    client_model: nn.Module,
+    server_model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+) -> Tuple[float, float]:
+    client_model.eval()
+    server_model.eval()
+    total = 0
+    correct = 0
+    loss_sum = 0.0
+    criterion = nn.CrossEntropyLoss()
+
+    for x, y in loader:
+        x = x.to(device)
+        y = y.to(device)
+        embedding = client_model(x)
+        logits = server_model(embedding)
+        loss = criterion(logits, y)
+        loss_sum += float(loss.item()) * int(y.shape[0])
+        preds = logits.argmax(dim=1)
+        correct += int((preds == y).sum().item())
+        total += int(y.shape[0])
+
+    if total == 0:
+        return 0.0, 0.0
+    return loss_sum / total, correct / total
+
+
+def _make_shuffled_loader(base: DataLoader, seed: int) -> DataLoader:
+    gen = torch.Generator()
+    gen.manual_seed(seed)
+    return DataLoader(
+        base.dataset,
+        batch_size=base.batch_size,
+        shuffle=True,
+        num_workers=base.num_workers,
+        pin_memory=base.pin_memory,
+        drop_last=base.drop_last,
+        collate_fn=base.collate_fn,
+        generator=gen,
+    )
+
+
+def train_one_epoch_split(
+    client_model: nn.Module,
+    server_model: nn.Module,
+    loader: DataLoader,
+    optim_client: torch.optim.Optimizer,
+    optim_server: torch.optim.Optimizer,
+    device: torch.device,
+    logger: CSVRunLogger,
+    epoch: int,
+    global_step_start: int,
+    bg_cfg: Optional[Dict[str, Any]] = None,
+    seed: int = 0,
+) -> int:
+    client_model.train()
+    server_model.train()
+    criterion = nn.CrossEntropyLoss()
+
+    global_step = global_step_start
+    burst_steps: List[int] = []
+    procs: List[subprocess.Popen] = []
+
+    if bg_cfg is not None and int(bg_cfg.get("bursts_per_epoch", 0)) > 0:
+        n_steps = len(loader)
+        k = min(int(bg_cfg["bursts_per_epoch"]), max(n_steps, 1))
+        rng = random.Random(seed + 1000 * epoch)
+        if n_steps > 0:
+            burst_steps = sorted(rng.sample(range(n_steps), k=k))
+        else:
+            burst_steps = [0] * k
+        logger.mark_event(
+            json.dumps(
+                {"bg_bursts": {"epoch": epoch, "steps": burst_steps, "cfg": bg_cfg}},
+                ensure_ascii=False,
+            )
+        )
+
+    # Pass 1: client embeddings
+    logger.mark_event(json.dumps({"phase": "client_forward_start", "epoch": epoch}, ensure_ascii=False))
+    logger.update_state(phase="client_forward")
+    train_loader_1 = _make_shuffled_loader(loader, seed=seed + epoch)
+    client_embedding: List[np.ndarray] = []
+    with torch.no_grad():
+        for x, _ in tqdm(train_loader_1, desc=f"epoch {epoch} client_forward", leave=True):
+            x = x.to(device)
+            emb = client_model(x).detach().cpu().numpy()
+            client_embedding.append(emb)
+    client_embedding_np = np.concatenate(client_embedding, axis=0) if client_embedding else np.zeros((0, 1))
+    logger.mark_event(json.dumps({"phase": "client_forward_end", "epoch": epoch}, ensure_ascii=False))
+
+    # Pass 2: server training on embeddings
+    logger.mark_event(json.dumps({"phase": "server_train_start", "epoch": epoch}, ensure_ascii=False))
+    logger.update_state(phase="server_train")
+    server_embedding = torch.from_numpy(client_embedding_np).to(device).detach().requires_grad_()
+    train_loader_2 = _make_shuffled_loader(loader, seed=seed + epoch)
+    i = 0
+    pbar = tqdm(train_loader_2, desc=f"epoch {epoch} server_train", leave=True)
+    for step, (x, y) in enumerate(pbar):
+        if bg_cfg is not None and burst_steps and step in burst_steps:
+            cmd = [
+                "bash",
+                str(bg_cfg["script"]),
+                "--on-sec",
+                str(bg_cfg["on_sec"]),
+                "--threads",
+                str(bg_cfg["threads"]),
+            ]
+            try:
+                proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                procs.append(proc)
+                logger.mark_event(
+                    json.dumps(
+                        {"bg_burst_start": {"epoch": epoch, "step": step, "cmd": cmd}},
+                        ensure_ascii=False,
+                    )
+                )
+            except Exception as e:
+                logger.mark_event(
+                    json.dumps(
+                        {
+                            "bg_burst_error": {
+                                "epoch": epoch,
+                                "step": step,
+                                "error": f"{type(e).__name__}: {e}",
+                                "cmd": cmd,
+                            }
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+
+        y = y.to(device)
+        logger.update_state(phase="server_train")
+        start_index = i * loader.batch_size
+        end_index = len(server_embedding) if i == len(train_loader_2) - 1 else (i + 1) * loader.batch_size
+        batch_server_embedding = server_embedding[start_index:end_index]
+
+        outputs = server_model(batch_server_embedding)
+        loss = criterion(outputs, y)
+        optim_server.zero_grad(set_to_none=True)
+        loss.backward()
+        optim_server.step()
+
+        with torch.no_grad():
+            preds = outputs.argmax(dim=1)
+            acc = float((preds == y).float().mean().item())
+
+        lr = float(optim_server.param_groups[0].get("lr", 0.0))
+        logger.update_state(epoch=epoch, step=step, global_step=global_step, loss=float(loss.item()), lr=lr, acc=acc)
+        pbar.set_postfix(loss=f"{loss.item():.4f}", acc=f"{acc:.3f}", lr=f"{lr:.2e}")
+
+        global_step += 1
+        i += 1
+    logger.mark_event(json.dumps({"phase": "server_train_end", "epoch": epoch}, ensure_ascii=False))
+
+    # Pass 3: client backprop with server gradients
+    if server_embedding.grad is not None:
+        logger.mark_event(json.dumps({"phase": "client_backward_start", "epoch": epoch}, ensure_ascii=False))
+        logger.update_state(phase="client_backward")
+        client_embedding_grad = server_embedding.grad.clone()
+        optim_client.zero_grad(set_to_none=True)
+        train_loader_3 = _make_shuffled_loader(loader, seed=seed + epoch)
+        i = 0
+        for x, _ in tqdm(train_loader_3, desc=f"epoch {epoch} client_back", leave=False):
+            x = x.to(device)
+            start_index = i * loader.batch_size
+            end_index = len(client_embedding_grad) if i == len(train_loader_3) - 1 else (i + 1) * loader.batch_size
+            batch_client_embedding_grad = client_embedding_grad[start_index:end_index]
+            new_embedding = client_model(x)
+            new_embedding.backward(batch_client_embedding_grad)
+            i += 1
+        optim_client.step()
+        logger.mark_event(json.dumps({"phase": "client_backward_end", "epoch": epoch}, ensure_ascii=False))
+
+    # Terminate any remaining background bursts at epoch end
+    for proc in procs:
+        try:
+            ret = proc.poll()
+            if ret is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2.0)
+                except Exception:
+                    proc.kill()
+                    proc.wait(timeout=2.0)
+                logger.mark_event(
+                    json.dumps(
+                        {"bg_burst_end": {"epoch": epoch, "status": "terminated"}},
+                        ensure_ascii=False,
+                    )
+                )
+            else:
+                logger.mark_event(
+                    json.dumps(
+                        {"bg_burst_end": {"epoch": epoch, "status": "exited", "code": int(ret)}},
+                        ensure_ascii=False,
+                    )
+                )
+        except Exception:
+            pass
+
+    return global_step
+
+
+# =============================
+# Main
+# =============================
+
+
+def _timestamp_name() -> str:
+    # Local time
+    return dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def infer_img_size(ds: HFDataset, image_col: str, sample_n: int = 64) -> Optional[int]:
+    # Try to infer a common square size from a small sample.
+    sizes: List[int] = []
+    n = min(len(ds), sample_n)
+    for i in range(n):
+        ex = ds[i]
+        img_any = ex[image_col]
+        if isinstance(img_any, dict) and "image" in img_any:
+            img = img_any["image"]
+        else:
+            img = img_any
+        if isinstance(img, Image.Image):
+            w, h = img.size
+            # If already square, prefer that.
+            if w == h:
+                sizes.append(w)
+            else:
+                sizes.append(int(round((w + h) / 2.0)))
+    if not sizes:
+        return None
+    # mode
+    vals, counts = np.unique(np.array(sizes), return_counts=True)
+    return int(vals[int(np.argmax(counts))])
+
+
+def build_splits(ds_dict: DatasetDict) -> Tuple[str, str]:
+    keys = list(ds_dict.keys())
+    if "train" in keys and "test" in keys:
+        return "train", "test"
+    if "train" in keys and "validation" in keys:
+        return "train", "validation"
+    # fallback: first two splits
+    if len(keys) >= 2:
+        return keys[0], keys[1]
+    # last resort: split train
+    return keys[0], "__split_from_train__"
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser()
+
+    # Data
+    p.add_argument("--dataset", type=str, default="kuchidareo/trashnet_small")
+    p.add_argument("--config", type=str, default=None, help="HF dataset config name (if needed)")
+    p.add_argument("--data-root", type=str, default="data", help="Root containing poisoning dirs")
+    p.add_argument(
+        "--poison-type",
+        type=str,
+        default="none",
+        choices=["none", "clean", "blurring", "occlusion", "label-flip"],
+    )
+    p.add_argument("--poison-frac", type=float, default=1.0, help="Fraction of poison samples to add (0..1)")
+    p.add_argument(
+        "--background-script",
+        type=str,
+        default=None,
+        help="Background workload script (per-epoch bursts)",
+    )
+    p.add_argument(
+        "--background-bursts-per-epoch",
+        type=int,
+        default=0,
+        help="Number of background bursts per epoch (0 disables)",
+    )
+    p.add_argument(
+        "--background-burst-on-sec",
+        type=int,
+        default=10,
+        help="ON duration per background burst (seconds)",
+    )
+    p.add_argument(
+        "--background-burst-threads",
+        type=int,
+        default=0,
+        help="Threads for background bursts (0=auto)",
+    )
+
+    # Training
+    p.add_argument("--epochs", type=int, default=5)
+    p.add_argument("--batch-size", type=int, default=64)
+    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--num-workers", type=int, default=2)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+
+    # Image
+    p.add_argument("--img-size", type=int, default=None, help="If not set, infer from dataset sample")
+    p.add_argument("--normalize", type=str, default="0.5", choices=["none", "0.5", "imagenet"])
+
+    # Logging
+    p.add_argument("--log-dir", type=str, default="logs")
+    p.add_argument("--log-fps", type=float, default=1.0)
+
+    # Subsampling
+    p.add_argument("--train-frac", type=float, default=1.0, help="Fraction of train split to use (0..1)")
+    p.add_argument("--test-frac", type=float, default=1.0, help="Fraction of test split to use (0..1)")
+
+    return p.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    set_seed(args.seed)
+
+    device = torch.device(args.device)
+
+    # Load HF dataset (clean)
+    ds_dict = load_dataset(args.dataset, args.config) if args.config else load_dataset(args.dataset)
+    train_split, test_split = build_splits(ds_dict)
+
+    if test_split == "__split_from_train__":
+        # Split train into train/test
+        ds_dict = ds_dict[train_split].train_test_split(test_size=0.2, seed=args.seed)
+        train_split, test_split = "train", "test"
+
+    train_hf = ds_dict[train_split]
+    test_hf = ds_dict[test_split]
+
+    image_col = _find_image_column(train_hf.features)
+    label_col = _find_label_column(train_hf.features)
+    class_names = _get_class_names(train_hf, label_col)
+
+    # Determine number of classes
+    if class_names is not None:
+        n_classes = len(class_names)
+    else:
+        # best-effort
+        labels = set(int(train_hf[i][label_col]) for i in range(min(len(train_hf), 5000)))
+        n_classes = len(labels)
+
+    # Image size
+    img_size = args.img_size
+    if img_size is None:
+        inferred = infer_img_size(train_hf, image_col)
+        img_size = inferred if inferred is not None else 224
+
+    tfm_cfg = TransformConfig(img_size=int(img_size), normalize=args.normalize)
+
+    # Build datasets
+    clean_train = CleanHFDataset(train_hf, image_col=image_col, label_col=label_col, tfm_cfg=tfm_cfg)
+    clean_test = CleanHFDataset(test_hf, image_col=image_col, label_col=label_col, tfm_cfg=tfm_cfg)
+
+    # Optional subsampling (after inferring classes/img size)
+    clean_train = subsample_dataset(clean_train, frac=float(args.train_frac), seed=args.seed)
+    clean_test = subsample_dataset(clean_test, frac=float(args.test_frac), seed=args.seed + 1)
+
+    train_ds: Dataset
+    target_n = len(clean_train)
+    if args.poison_type == "none":
+        train_ds = clean_train
+    elif args.poison_type == "clean":
+        variant_dir = Path(args.data_root) / "clean"
+        clean_disk = PoisonDiskDataset(variant_dir=variant_dir, split_name=train_split, tfm_cfg=tfm_cfg)
+        clean_disk = subsample_dataset(clean_disk, frac=float(args.train_frac), seed=args.seed + 2)
+        train_ds = sample_n_dataset(clean_disk, n=target_n, seed=args.seed + 3)
+    else:
+        variant_dir = Path(args.data_root) / args.poison_type
+        poison_train = PoisonDiskDataset(variant_dir=variant_dir, split_name=train_split, tfm_cfg=tfm_cfg)
+        poison_train = subsample_dataset(poison_train, frac=float(args.train_frac), seed=args.seed + 2)
+
+        poison_k = int(round(target_n * float(args.poison_frac)))
+        poison_k = max(0, min(poison_k, len(poison_train)))
+        clean_k = max(0, target_n - poison_k)
+
+        poison_sampled = sample_n_dataset(poison_train, n=poison_k, seed=args.seed)
+        clean_sampled = sample_n_dataset(clean_train, n=clean_k, seed=args.seed + 1)
+        train_ds = ConcatDataset([clean_sampled, poison_sampled])
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=(device.type == "cuda"),
+    )
+
+    test_loader = DataLoader(
+        clean_test,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=(device.type == "cuda"),
+    )
+
+    # Model (split learning)
+    client_model = ClientTrashNet(img_size=int(img_size)).to(device)
+    server_model = ServerTrashNet(feature_dim=client_model.feature_dim, n_classes=n_classes).to(device)
+    optim_client = torch.optim.Adam(client_model.parameters(), lr=float(args.lr))
+    optim_server = torch.optim.Adam(server_model.parameters(), lr=float(args.lr))
+
+    # Logger
+    log_dir = Path(args.log_dir)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    out_csv = log_dir / f"{_timestamp_name()}.csv"
+
+    proc = psutil.Process(os.getpid())
+    collectors: List[MetricsCollector] = [SystemCollector(proc)]
+    logger = CSVRunLogger(out_csv=out_csv, fps=float(args.log_fps), collectors=collectors)
+
+    # Record static run info once (as an event row)
+    logger.start()
+    logger.update_state(
+        phase="init",
+        train_active=0,
+        epoch=None,
+        step=None,
+        global_step=None,
+        loss=None,
+        lr=float(args.lr),
+        acc=None,
+    )
+    logger.mark_event(
+        json.dumps(
+            {
+                "run_info": {
+                    "dataset": args.dataset,
+                    "config": args.config,
+                    "train_split": train_split,
+                    "test_split": test_split,
+                    "poison_type": args.poison_type,
+                    "poison_frac": float(args.poison_frac),
+                    "img_size": int(img_size),
+                    "normalize": args.normalize,
+                    "epochs": int(args.epochs),
+                    "batch_size": int(args.batch_size),
+                    "lr": float(args.lr),
+                    "seed": int(args.seed),
+                    "train_frac": float(args.train_frac),
+                    "test_frac": float(args.test_frac),
+                    "device": str(device),
+                    "platform": platform.platform(),
+                    "python": platform.python_version(),
+                    "torch": torch.__version__,
+                    "background_script": args.background_script,
+                    "background_bursts_per_epoch": int(args.background_bursts_per_epoch),
+                    "background_burst_on_sec": int(args.background_burst_on_sec),
+                    "background_burst_threads": int(args.background_burst_threads),
+                }
+            },
+            ensure_ascii=False,
+        )
+    )
+
+    print("=== Run ===")
+    print(f"dataset={args.dataset} split=({train_split},{test_split}) poison={args.poison_type} frac={args.poison_frac}")
+    print(f"img_size={img_size} normalize={args.normalize} n_classes={n_classes} device={device}")
+    print(f"log_csv={out_csv}")
+
+    # Training
+    global_step = 0
+    logger.enable()
+    logger.mark_event("train_start")
+
+    try:
+        bg_cfg: Optional[Dict[str, Any]] = None
+        if args.background_script:
+            bg_cfg = {
+                "script": str(args.background_script),
+                "bursts_per_epoch": int(args.background_bursts_per_epoch),
+                "on_sec": int(args.background_burst_on_sec),
+                "threads": int(args.background_burst_threads),
+            }
+        for epoch in range(int(args.epochs)):
+            global_step = train_one_epoch_split(
+                client_model=client_model,
+                server_model=server_model,
+                loader=train_loader,
+                optim_client=optim_client,
+                optim_server=optim_server,
+                device=device,
+                logger=logger,
+                epoch=epoch,
+                global_step_start=global_step,
+                bg_cfg=bg_cfg,
+                seed=int(args.seed),
+            )
+
+            # Mark end of each epoch
+            logger.mark_event(f"epoch_end_{epoch}")
+
+        # Mark end of full training
+        logger.mark_event("train_end")
+        logger.disable()
+
+        # Evaluation (logger disabled by default)
+        test_loss, test_acc = evaluate_split(client_model, server_model, test_loader, device=device)
+        print(f"test_loss={test_loss:.4f} test_acc={test_acc:.4f}")
+
+        # Record evaluation summary as an event row (does not resume 1FPS logging)
+        logger.mark_event(json.dumps({"eval": {"loss": test_loss, "acc": test_acc}}, ensure_ascii=False))
+
+    finally:
+        logger.stop()
+
+
+if __name__ == "__main__":
+    main()

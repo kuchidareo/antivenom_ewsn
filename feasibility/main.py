@@ -63,6 +63,13 @@ def parse_args() -> argparse.Namespace:
         help="Which modes to run",
     )
     p.add_argument(
+        "--train-mode",
+        type=str,
+        default="fl",
+        choices=["fl", "sl"],
+        help="Training mode: fl=single model, sl=split learning",
+    )
+    p.add_argument(
         "--background-script",
         type=str,
         default=None,
@@ -103,7 +110,7 @@ def parse_args() -> argparse.Namespace:
 def run_one(mode: str, args: argparse.Namespace) -> None:
     """Run one experiment mode via subprocess."""
     here = Path(__file__).resolve().parent
-    ml_script = here / "ml_running.py"
+    ml_script = here / ("sl_running.py" if args.train_mode == "sl" else "ml_running.py")
 
     log_dir = Path(args.log_root) / ("clean" if mode in ("none", "clean") else mode)
     log_dir.mkdir(parents=True, exist_ok=True)
