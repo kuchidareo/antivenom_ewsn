@@ -803,6 +803,19 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Threads for background bursts (0=auto)",
     )
+    p.add_argument(
+        "--background-mode",
+        type=str,
+        default="epoch",
+        choices=["epoch", "once"],
+        help="Background run mode: epoch=bursts per epoch, once=single run for full training",
+    )
+    p.add_argument(
+        "--background-once-sec",
+        type=int,
+        default=0,
+        help="Duration of background run when mode=once (0=do not stop)",
+    )
 
     # Training
     p.add_argument("--epochs", type=int, default=5)
@@ -972,6 +985,8 @@ def main() -> None:
                     "background_bursts_per_epoch": int(args.background_bursts_per_epoch),
                     "background_burst_on_sec": int(args.background_burst_on_sec),
                     "background_burst_threads": int(args.background_burst_threads),
+                    "background_mode": args.background_mode,
+                    "background_once_sec": int(args.background_once_sec),
                 }
             },
             ensure_ascii=False,
@@ -990,6 +1005,7 @@ def main() -> None:
 
     try:
         bg_cfg: Optional[Dict[str, Any]] = None
+        bg_proc: Optional[subprocess.Popen] = None
         if args.background_script:
             bg_cfg = {
                 "script": str(args.background_script),
@@ -997,6 +1013,25 @@ def main() -> None:
                 "on_sec": int(args.background_burst_on_sec),
                 "threads": int(args.background_burst_threads),
             }
+            if args.background_mode == "once":
+                cmd = [
+                    "bash",
+                    str(args.background_script),
+                    "--on-sec",
+                    str(args.background_once_sec),
+                    "--threads",
+                    str(args.background_burst_threads),
+                ]
+                try:
+                    bg_proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    logger.mark_event(json.dumps({"bg_once_start": {"cmd": cmd}}, ensure_ascii=False))
+                except Exception as e:
+                    logger.mark_event(
+                        json.dumps(
+                            {"bg_once_error": {"error": f"{type(e).__name__}: {e}", "cmd": cmd}},
+                            ensure_ascii=False,
+                        )
+                    )
         for epoch in range(int(args.epochs)):
             global_step = train_one_epoch(
                 model=model,
@@ -1025,6 +1060,18 @@ def main() -> None:
         logger.mark_event(json.dumps({"eval": {"loss": test_loss, "acc": test_acc}}, ensure_ascii=False))
 
     finally:
+        if bg_proc is not None:
+            try:
+                ret = bg_proc.poll()
+                if ret is None:
+                    bg_proc.terminate()
+                    try:
+                        bg_proc.wait(timeout=3.0)
+                    except Exception:
+                        bg_proc.kill()
+                logger.mark_event(json.dumps({"bg_once_end": {"status": "stopped"}}, ensure_ascii=False))
+            except Exception:
+                pass
         logger.stop()
 
 

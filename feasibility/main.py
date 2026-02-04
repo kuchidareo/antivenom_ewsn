@@ -100,6 +100,19 @@ def parse_args() -> argparse.Namespace:
         help="Threads for background bursts (0=auto)",
     )
     p.add_argument(
+        "--background-mode",
+        type=str,
+        default="epoch",
+        choices=["epoch", "once"],
+        help="Background run mode: epoch=bursts per epoch, once=single run for full training",
+    )
+    p.add_argument(
+        "--background-once-sec",
+        type=int,
+        default=0,
+        help="Duration of background run when mode=once (0=do not stop)",
+    )
+    p.add_argument(
         "--prepare-data",
         action="store_true",
         help="If set, run data_preparing.py when poison data is missing",
@@ -173,6 +186,8 @@ def run_one(mode: str, args: argparse.Namespace) -> None:
         cmd.extend(["--background-bursts-per-epoch", str(args.background_bursts_per_epoch)])
         cmd.extend(["--background-burst-on-sec", str(args.background_burst_on_sec)])
         cmd.extend(["--background-burst-threads", str(args.background_burst_threads)])
+        cmd.extend(["--background-mode", str(args.background_mode)])
+        cmd.extend(["--background-once-sec", str(args.background_once_sec)])
     subprocess.run(cmd, check=True)
 
 
