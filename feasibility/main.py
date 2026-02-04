@@ -175,7 +175,7 @@ def run_one(mode: str, args: argparse.Namespace) -> None:
 
     if args.device:
         cmd.extend(["--device", args.device])
-    if args.model:
+    if args.model and args.train_mode == "fl":
         cmd.extend(["--model", args.model])
 
     print("\n=== Running ===")

@@ -7,6 +7,7 @@ Goal
   1) blurring: very strong Gaussian blur on the whole image
   2) occlusion: draw a single black rectangular mask covering 10–50% of width/height
   3) label-flip: keep the image unchanged but flip the label to a random *different* class
+  4) steganography: hide a short secret message in LSBs
 - Save results to `data/` as JPEGs in a flat layout per variant:
 
     data/
@@ -16,6 +17,8 @@ Goal
       occlusion/metadata.jsonl
       label-flip/*.jpg
       label-flip/metadata.jsonl
+      steganography/*.jpg
+      steganography/metadata.jsonl
 
 Each JSONL line contains at least:
   {"file": "<filename>.jpg", "label": <int>}
@@ -58,7 +61,7 @@ class PreprocessConfig:
     occlusion_max_frac: float = 0.50  # max fraction of width/height
 
 
-VARIANTS = ("clean", "blurring", "occlusion", "label-flip")
+VARIANTS = ("clean", "blurring", "occlusion", "label-flip", "steganography")
 
 
 # -----------------------------
@@ -144,6 +147,83 @@ def flip_label_random_other(label: int, n_classes: int, rng: random.Random) -> i
 
 
 # -----------------------------
+# Steganography helpers
+# -----------------------------
+
+
+STEGO_TEXT = "Lorem ipsum dolor sit amet. consectupidatat non proident, sunt in culpa qui offici."
+STEGO_DELIM = "#####"
+
+
+def message_to_binary(message):
+    if isinstance(message, str):
+        return "".join([format(ord(i), "08b") for i in message])
+    if isinstance(message, (bytes, np.ndarray)):
+        return [format(i, "08b") for i in message]
+    if isinstance(message, (int, np.uint8)):
+        return format(message, "08b")
+    raise TypeError("Input type not supported.")
+
+
+def hide_data(image: np.ndarray, secret_message: str) -> np.ndarray:
+    n_bytes = image.shape[0] * image.shape[1] // 2
+    if len(secret_message) > n_bytes:
+        # Truncate to fit
+        secret_message = secret_message[: max(1, n_bytes - len(STEGO_DELIM))]
+    secret_message += STEGO_DELIM
+    data_index = 0
+    binary_secret_msg = message_to_binary(secret_message)
+    data_len = len(binary_secret_msg)
+    for values in image:
+        for pixel in values:
+            r, g, b = message_to_binary(pixel)
+            if data_index < data_len:
+                pixel[0] = int(binary_secret_msg[data_index] + r[1:], 2)
+                data_index += 1
+            if data_index < data_len:
+                pixel[1] = int(binary_secret_msg[data_index] + g[1:], 2)
+                data_index += 1
+            if data_index < data_len:
+                pixel[2] = int(binary_secret_msg[data_index] + b[1:], 2)
+                data_index += 1
+            if data_index >= data_len:
+                break
+        if data_index >= data_len:
+            break
+    return image
+
+
+def show_data(image: np.ndarray) -> str:
+    binary_data = ""
+    for values in image:
+        for pixel in values:
+            r, g, b = message_to_binary(pixel)
+            binary_data += r[0]
+            binary_data += g[0]
+            binary_data += b[0]
+
+    all_bytes = [binary_data[i : i + 8] for i in range(0, len(binary_data), 8)]
+    decoded_data = ""
+    for byte in all_bytes:
+        decoded_data += chr(int(byte, 2))
+        if decoded_data.endswith(STEGO_DELIM):
+            break
+    return decoded_data[: -len(STEGO_DELIM)]
+
+
+def apply_steganography(img: Image.Image) -> Image.Image:
+    img = ensure_rgb(img)
+    arr = np.array(img)
+    stego = hide_data(arr.copy(), STEGO_TEXT)
+    # Best-effort check
+    try:
+        assert STEGO_TEXT.startswith(show_data(stego))
+    except Exception:
+        pass
+    return Image.fromarray(stego)
+
+
+# -----------------------------
 # IO helpers
 # -----------------------------
 
@@ -204,6 +284,7 @@ def process_split(
     blur_meta = out_root / "blurring" / "metadata.jsonl"
     occ_meta = out_root / "occlusion" / "metadata.jsonl"
     flip_meta = out_root / "label-flip" / "metadata.jsonl"
+    stego_meta = out_root / "steganography" / "metadata.jsonl"
 
     for idx in tqdm(range(limit), desc=f"Processing {split_name}"):
         ex = ds[idx]
@@ -296,6 +377,24 @@ def process_split(
                 "orig_label": label,
                 "orig_label_name": label_name,
                 "label_name": new_label_name,
+            },
+        )
+
+        # 4) steganography
+        v = "steganography"
+        file_id = stable_id(split_name, idx, v)
+        filename = f"{split_name}_{file_id}.jpg"
+        out_path = out_root / v / filename
+        out_img = apply_steganography(img)
+        save_jpeg(out_img, out_path)
+        append_jsonl(
+            stego_meta,
+            {
+                "file": filename,
+                "label": label,
+                "split": split_name,
+                "orig_label": label,
+                "label_name": label_name,
             },
         )
 
