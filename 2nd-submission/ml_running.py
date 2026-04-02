@@ -31,6 +31,7 @@ import argparse
 import csv
 import datetime as dt
 import json
+import math
 import os
 import platform
 import random
@@ -49,7 +50,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision import models
 from torch.utils.data import ConcatDataset, DataLoader, Dataset
 
 # HF deps
@@ -315,6 +315,8 @@ class SimpleCNN(nn.Module):
 class MobileNetV3Large(nn.Module):
     def __init__(self, num_classes: int) -> None:
         super().__init__()
+        from torchvision import models
+
         self.model = models.mobilenet_v3_large(weights=models.MobileNet_V3_Large_Weights.IMAGENET1K_V2)
         in_features = self.model.classifier[-1].in_features
         self.model.classifier[-1] = nn.Linear(in_features, num_classes)
@@ -563,29 +565,45 @@ class TensorReferenceManager:
         dataset: str,
         model_name: str,
         poison_type: str,
+        save_reference: bool = False,
     ) -> None:
         self.model = model
         self.root_dir = root_dir
         self.dataset = dataset
         self.model_name = model_name
         self.poison_type = poison_type
+        self.save_reference = save_reference
         self.reference_dir = self.root_dir / "gradient_reference"
-        self.reference_dir.mkdir(parents=True, exist_ok=True)
         dataset_key = self._sanitize_name(dataset.replace("/", "_"))
         self.reference_path = self.reference_dir / f"{self._sanitize_name(model_name)}_{dataset_key}.pt"
+        if self.save_reference or self.reference_path.exists():
+            self.reference_dir.mkdir(parents=True, exist_ok=True)
 
         self.layer_modules: List[Tuple[str, nn.Module]] = []
         self.forward_column_map: Dict[str, str] = {}
         self.backward_column_map: Dict[str, str] = {}
+        self.forward_cosine_column_map: Dict[str, str] = {}
+        self.backward_cosine_column_map: Dict[str, str] = {}
+        self.forward_sparsity_column_map: Dict[str, str] = {}
+        self.backward_sparsity_column_map: Dict[str, str] = {}
         self._forward_handles: List[Any] = []
         self._backward_handles: List[Any] = []
         self._current_forward: Dict[str, torch.Tensor] = {}
         self._current_backward: Dict[str, torch.Tensor] = {}
+        self._current_forward_sparsity: Dict[str, float] = {}
+        self._current_backward_sparsity: Dict[str, float] = {}
+        self._current_forward_cacheline_map: Dict[str, torch.Tensor] = {}
+        self._current_forward_page_map: Dict[str, torch.Tensor] = {}
+        self._current_backward_cacheline_map: Dict[str, torch.Tensor] = {}
+        self._current_backward_page_map: Dict[str, torch.Tensor] = {}
+        self._current_forward_spatial_map: Dict[str, torch.Tensor] = {}
+        self._current_backward_spatial_map: Dict[str, torch.Tensor] = {}
         self.reference_forward: Dict[str, torch.Tensor] = {}
         self.reference_backward: Dict[str, torch.Tensor] = {}
         self.reference_loaded = False
         self.reference_saved_this_run = False
         self.reference_layer_names: List[str] = []
+        self.sparsity_tau = 1e-8
 
         for name, module in self.model.named_modules():
             params = list(module.parameters(recurse=False))
@@ -595,6 +613,10 @@ class TensorReferenceManager:
             safe = self._sanitize_name(name)
             self.forward_column_map[name] = f"forward_rmse_{safe}"
             self.backward_column_map[name] = f"backward_rmse_{safe}"
+            self.forward_cosine_column_map[name] = f"forward_cosine_{safe}"
+            self.backward_cosine_column_map[name] = f"backward_cosine_{safe}"
+            self.forward_sparsity_column_map[name] = f"forward_sparsity_{safe}"
+            self.backward_sparsity_column_map[name] = f"backward_sparsity_{safe}"
 
         self.reference_layer_names = [name for name, _ in self.layer_modules]
         self._load_reference()
@@ -626,11 +648,116 @@ class TensorReferenceManager:
         return tensor.detach().float().cpu().reshape(-1).clone()
 
     @staticmethod
+    def _to_batched_tensor(obj: Any) -> Optional[torch.Tensor]:
+        if not torch.is_tensor(obj):
+            return None
+        if obj.dim() == 0:
+            return obj.view(1, 1)
+        if obj.dim() == 1:
+            return obj.unsqueeze(0)
+        return obj
+
+    @staticmethod
+    def _block_active_counts_per_sample(x_sample_flat: torch.Tensor, tau: float = 1e-6, block_bytes: int = 64) -> torch.Tensor:
+        elem_size = x_sample_flat.element_size()
+        elems_per_block = max(1, block_bytes // elem_size)
+        active = (x_sample_flat.abs() > tau).to(torch.float32)
+        n = active.numel()
+        num_blocks = math.ceil(n / elems_per_block)
+        pad = num_blocks * elems_per_block - n
+        if pad > 0:
+            active = torch.cat([active, torch.zeros(pad, dtype=active.dtype, device=active.device)], dim=0)
+        return active.view(num_blocks, elems_per_block).sum(dim=1)
+
+    @staticmethod
+    def _pad_and_stack(vectors: list[torch.Tensor]) -> Optional[torch.Tensor]:
+        if not vectors:
+            return None
+        max_len = max(v.numel() for v in vectors)
+        out = []
+        for vec in vectors:
+            if vec.numel() < max_len:
+                pad = torch.zeros(max_len - vec.numel(), dtype=vec.dtype, device=vec.device)
+                vec = torch.cat([vec, pad], dim=0)
+            out.append(vec.unsqueeze(0))
+        return torch.cat(out, dim=0)
+
+    def _avg_block_activity_vector(self, output: Any, block_bytes: int) -> Optional[torch.Tensor]:
+        tensor = self._first_tensor(output)
+        if tensor is None:
+            return None
+        batched = self._to_batched_tensor(tensor)
+        if batched is None:
+            return None
+        batched = batched.detach()
+        vectors: list[torch.Tensor] = []
+        for idx in range(batched.shape[0]):
+            flat = batched[idx].reshape(-1)
+            vectors.append(self._block_active_counts_per_sample(flat, tau=1e-6, block_bytes=block_bytes))
+        mat = self._pad_and_stack(vectors)
+        if mat is None:
+            return None
+        return mat.mean(dim=0).detach().cpu()
+
+    @staticmethod
+    def _spatial_activity_map(output: Any) -> Optional[torch.Tensor]:
+        tensor = TensorReferenceManager._first_tensor(output)
+        if tensor is None:
+            return None
+        tensor = tensor.detach().float()
+        if tensor.dim() >= 4:
+            spatial = tensor.abs().mean(dim=0).mean(dim=0)
+        elif tensor.dim() == 3:
+            spatial = tensor.abs().mean(dim=0)
+        elif tensor.dim() == 2:
+            spatial = tensor.abs().mean(dim=0, keepdim=True)
+        elif tensor.dim() == 1:
+            spatial = tensor.abs().unsqueeze(0)
+        elif tensor.dim() == 0:
+            spatial = tensor.abs().view(1, 1)
+        else:
+            return None
+        return spatial.detach().cpu()
+
+    @staticmethod
+    def _tensor_sparsity(tensor: torch.Tensor, tau: float = 1e-8) -> float:
+        if tensor is None or tensor.numel() == 0:
+            return 0.0
+        tensor = tensor.detach()
+        return float((tensor.abs() <= tau).float().mean().item())
+
+    @classmethod
+    def _extract_tensor_sparsity(cls, obj: Any, tau: float = 1e-8) -> float:
+        if torch.is_tensor(obj):
+            return cls._tensor_sparsity(obj, tau)
+        if isinstance(obj, (tuple, list)):
+            total_zeros = 0
+            total_elems = 0
+            for item in obj:
+                if torch.is_tensor(item):
+                    item = item.detach()
+                    total_zeros += int((item.abs() <= tau).sum().item())
+                    total_elems += int(item.numel())
+            return float(total_zeros / total_elems) if total_elems > 0 else 0.0
+        return 0.0
+
+    @staticmethod
     def _rmse(current: torch.Tensor, reference: torch.Tensor) -> Optional[float]:
         if current.numel() != reference.numel():
             return None
         diff = current - reference
         return float(torch.sqrt(torch.mean(diff * diff)).item())
+
+    @staticmethod
+    def _cosine_similarity(current: torch.Tensor, reference: torch.Tensor) -> Optional[float]:
+        if current.numel() != reference.numel():
+            return None
+        current_norm = torch.linalg.vector_norm(current)
+        reference_norm = torch.linalg.vector_norm(reference)
+        denom = current_norm * reference_norm
+        if float(denom.item()) == 0.0:
+            return None
+        return float(torch.dot(current, reference).div(denom).item())
 
     def _load_reference(self) -> None:
         if not self.reference_path.exists():
@@ -668,6 +795,16 @@ class TensorReferenceManager:
             if tensor is None:
                 return
             self._current_forward[name] = self._vectorize_tensor(tensor)
+            self._current_forward_sparsity[name] = self._extract_tensor_sparsity(output, self.sparsity_tau)
+            cacheline_map = self._avg_block_activity_vector(output, block_bytes=64)
+            page_map = self._avg_block_activity_vector(output, block_bytes=4096)
+            if cacheline_map is not None:
+                self._current_forward_cacheline_map[name] = cacheline_map
+            if page_map is not None:
+                self._current_forward_page_map[name] = page_map
+            spatial_map = self._spatial_activity_map(output)
+            if spatial_map is not None:
+                self._current_forward_spatial_map[name] = spatial_map
 
         return hook
 
@@ -677,24 +814,50 @@ class TensorReferenceManager:
             if tensor is None:
                 return
             self._current_backward[name] = self._vectorize_tensor(tensor)
+            self._current_backward_sparsity[name] = self._extract_tensor_sparsity(grad_output, self.sparsity_tau)
+            cacheline_map = self._avg_block_activity_vector(grad_output, block_bytes=64)
+            page_map = self._avg_block_activity_vector(grad_output, block_bytes=4096)
+            if cacheline_map is not None:
+                self._current_backward_cacheline_map[name] = cacheline_map
+            if page_map is not None:
+                self._current_backward_page_map[name] = page_map
+            spatial_map = self._spatial_activity_map(grad_output)
+            if spatial_map is not None:
+                self._current_backward_spatial_map[name] = spatial_map
 
         return hook
 
     def reset_step(self) -> None:
         self._current_forward = {}
         self._current_backward = {}
+        self._current_forward_sparsity = {}
+        self._current_backward_sparsity = {}
+        self._current_forward_cacheline_map = {}
+        self._current_forward_page_map = {}
+        self._current_backward_cacheline_map = {}
+        self._current_backward_page_map = {}
+        self._current_forward_spatial_map = {}
+        self._current_backward_spatial_map = {}
 
     def empty_state(self) -> Dict[str, Any]:
-        state: Dict[str, Any] = {}
+        state: Dict[str, Any] = {
+            "rmse_status": "init",
+            "rmse_mismatch_layers": "",
+            "rmse_available_layers": 0,
+        }
         for name in self.reference_layer_names:
             state[self.forward_column_map[name]] = None
             state[self.backward_column_map[name]] = None
+            state[self.forward_cosine_column_map[name]] = None
+            state[self.backward_cosine_column_map[name]] = None
+            state[self.forward_sparsity_column_map[name]] = None
+            state[self.backward_sparsity_column_map[name]] = None
         return state
 
     def maybe_save_reference(self) -> bool:
-        if self.reference_loaded or self.reference_saved_this_run:
+        if not self.save_reference:
             return False
-        if self.poison_type not in {"none", "clean"}:
+        if self.reference_loaded or self.reference_saved_this_run:
             return False
         if not self._current_forward or not self._current_backward:
             return False
@@ -703,6 +866,7 @@ class TensorReferenceManager:
                 "dataset": self.dataset,
                 "model": self.model_name,
                 "poison_type": self.poison_type,
+                "layer_names": list(self.reference_layer_names),
             },
             "forward": {name: tensor.clone() for name, tensor in self._current_forward.items()},
             "backward": {name: tensor.clone() for name, tensor in self._current_backward.items()},
@@ -717,18 +881,104 @@ class TensorReferenceManager:
     def compute_rmse_state(self) -> Dict[str, Any]:
         state = self.empty_state()
         if not self.reference_loaded:
+            state["rmse_status"] = "missing_reference"
             return state
+        matched_layers = 0
+        mismatch_layers: List[str] = []
         for name in self.reference_layer_names:
+            if name in self._current_forward_sparsity:
+                state[self.forward_sparsity_column_map[name]] = self._current_forward_sparsity[name]
+            if name in self._current_backward_sparsity:
+                state[self.backward_sparsity_column_map[name]] = self._current_backward_sparsity[name]
+
             current_forward = self._current_forward.get(name)
             reference_forward = self.reference_forward.get(name)
             if current_forward is not None and reference_forward is not None:
-                state[self.forward_column_map[name]] = self._rmse(current_forward, reference_forward)
+                value = self._rmse(current_forward, reference_forward)
+                state[self.forward_column_map[name]] = value
+                state[self.forward_cosine_column_map[name]] = self._cosine_similarity(current_forward, reference_forward)
+                if value is None:
+                    mismatch_layers.append(f"forward:{name}[{current_forward.numel()}!={reference_forward.numel()}]")
+                else:
+                    matched_layers += 1
 
             current_backward = self._current_backward.get(name)
             reference_backward = self.reference_backward.get(name)
             if current_backward is not None and reference_backward is not None:
-                state[self.backward_column_map[name]] = self._rmse(current_backward, reference_backward)
+                value = self._rmse(current_backward, reference_backward)
+                state[self.backward_column_map[name]] = value
+                state[self.backward_cosine_column_map[name]] = self._cosine_similarity(current_backward, reference_backward)
+                if value is None:
+                    mismatch_layers.append(f"backward:{name}[{current_backward.numel()}!={reference_backward.numel()}]")
+                else:
+                    matched_layers += 1
+        state["rmse_available_layers"] = matched_layers
+        if matched_layers > 0:
+            state["rmse_status"] = "ok"
+        elif mismatch_layers:
+            state["rmse_status"] = "shape_mismatch"
+        else:
+            state["rmse_status"] = "no_hook_data"
+        state["rmse_mismatch_layers"] = ";".join(mismatch_layers[:8])
         return state
+
+    def save_occupancy_snapshot(self, output_dir: Path, *, epoch: int, step: int, global_step: int) -> Optional[Path]:
+        if (
+            not self._current_forward_cacheline_map
+            and not self._current_forward_page_map
+            and not self._current_backward_cacheline_map
+            and not self._current_backward_page_map
+        ):
+            return None
+        output_dir.mkdir(parents=True, exist_ok=True)
+        path = output_dir / f"epoch{epoch:03d}_step{step:05d}_global{global_step:05d}.pt"
+        payload = {
+            "meta": {
+                "epoch": int(epoch),
+                "step": int(step),
+                "global_step": int(global_step),
+            },
+            "forward_cacheline": {name: tensor.clone() for name, tensor in self._current_forward_cacheline_map.items()},
+            "forward_page": {name: tensor.clone() for name, tensor in self._current_forward_page_map.items()},
+            "backward_cacheline": {name: tensor.clone() for name, tensor in self._current_backward_cacheline_map.items()},
+            "backward_page": {name: tensor.clone() for name, tensor in self._current_backward_page_map.items()},
+            "forward_spatial": {name: tensor.clone() for name, tensor in self._current_forward_spatial_map.items()},
+            "backward_spatial": {name: tensor.clone() for name, tensor in self._current_backward_spatial_map.items()},
+        }
+        torch.save(payload, path)
+        return path
+
+
+def bootstrap_reference_from_clean_batch(
+    *,
+    model: nn.Module,
+    clean_loader: DataLoader,
+    device: torch.device,
+    reference_manager: TensorReferenceManager,
+) -> bool:
+    if reference_manager.reference_loaded:
+        return False
+
+    try:
+        x, y = next(iter(clean_loader))
+    except StopIteration:
+        return False
+
+    criterion = nn.CrossEntropyLoss()
+    was_training = model.training
+    reference_manager.reset_step()
+    model.zero_grad(set_to_none=True)
+    model.train()
+    x = x.to(device)
+    y = y.to(device)
+    logits = model(x)
+    loss = criterion(logits, y)
+    loss.backward()
+    saved = reference_manager.maybe_save_reference()
+    model.zero_grad(set_to_none=True)
+    if not was_training:
+        model.eval()
+    return saved
 
 
 class CSVRunLogger:
@@ -887,6 +1137,8 @@ def train_one_epoch(
     device: torch.device,
     logger: CSVRunLogger,
     reference_manager: TensorReferenceManager,
+    occupancy_dir: Path,
+    save_occupancy_snapshots: bool,
     epoch: int,
     global_step_start: int,
     bg_cfg: Optional[Dict[str, Any]] = None,
@@ -898,6 +1150,7 @@ def train_one_epoch(
     global_step = global_step_start
     burst_steps: List[int] = []
     procs: List[subprocess.Popen] = []
+    occupancy_logged = False
 
     if bg_cfg is not None and int(bg_cfg.get("bursts_per_epoch", 0)) > 0:
         n_steps = len(loader)
@@ -975,6 +1228,26 @@ def train_one_epoch(
             acc=acc,
             **rmse_state,
         )
+        if save_occupancy_snapshots:
+            occupancy_path = reference_manager.save_occupancy_snapshot(
+                occupancy_dir,
+                epoch=epoch,
+                step=step,
+                global_step=global_step,
+            )
+            if occupancy_path is not None and not occupancy_logged:
+                logger.mark_event(
+                    json.dumps(
+                        {
+                            "occupancy_snapshot_dir": {
+                                "path": str(occupancy_dir),
+                                "example_file": str(occupancy_path),
+                            }
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+                occupancy_logged = True
         if reference_saved:
             logger.mark_event(
                 json.dumps(
@@ -1143,6 +1416,16 @@ def parse_args() -> argparse.Namespace:
     # Logging
     p.add_argument("--log-dir", type=str, default="logs")
     p.add_argument("--log-fps", type=float, default=1.0)
+    p.add_argument(
+        "--save-gradient-reference",
+        action="store_true",
+        help="Write gradient reference tensors to gradient_reference/*.pt",
+    )
+    p.add_argument(
+        "--save-occupancy-snapshots",
+        action="store_true",
+        help="Write per-step occupancy .pt snapshots beside the CSV log",
+    )
 
     # Subsampling
     p.add_argument("--train-frac", type=float, default=1.0, help="Fraction of train split to use (0..1)")
@@ -1226,6 +1509,13 @@ def main() -> None:
         num_workers=args.num_workers,
         pin_memory=(device.type == "cuda"),
     )
+    clean_reference_loader = DataLoader(
+        clean_train,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=(device.type == "cuda"),
+    )
 
     test_loader = DataLoader(
         clean_test,
@@ -1248,12 +1538,14 @@ def main() -> None:
         dataset=args.dataset,
         model_name=args.model,
         poison_type=args.poison_type,
+        save_reference=bool(args.save_gradient_reference),
     )
 
     # Logger
     log_dir = Path(args.log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
     out_csv = log_dir / f"{_timestamp_name()}.csv"
+    occupancy_dir = log_dir / f"{out_csv.stem}_occupancy"
 
     collectors: List[MetricsCollector] = [PerfCollector(pid=os.getpid(), fps=float(args.log_fps))]
     logger = CSVRunLogger(out_csv=out_csv, fps=float(args.log_fps), collectors=collectors)
@@ -1296,12 +1588,15 @@ def main() -> None:
                     "model": args.model,
                     "gradient_reference_path": str(reference_manager.reference_path),
                     "gradient_reference_loaded": bool(reference_manager.reference_loaded),
+                    "save_gradient_reference": bool(args.save_gradient_reference),
                     "background_script": args.background_script,
                     "background_bursts_per_epoch": int(args.background_bursts_per_epoch),
                     "background_burst_on_sec": int(args.background_burst_on_sec),
                     "background_burst_threads": int(args.background_burst_threads),
                     "background_mode": args.background_mode,
                     "background_once_sec": int(args.background_once_sec),
+                    "save_occupancy_snapshots": bool(args.save_occupancy_snapshots),
+                    "occupancy_dir": str(occupancy_dir) if args.save_occupancy_snapshots else None,
                 }
             },
             ensure_ascii=False,
@@ -1312,6 +1607,26 @@ def main() -> None:
     print(f"dataset={args.dataset} split=({train_split},{test_split}) poison={args.poison_type} frac={args.poison_frac}")
     print(f"img_size={img_size} normalize={args.normalize} n_classes={n_classes} device={device}")
     print(f"log_csv={out_csv}")
+
+    if reference_manager.save_reference and not reference_manager.reference_loaded:
+        if bootstrap_reference_from_clean_batch(
+            model=model,
+            clean_loader=clean_reference_loader,
+            device=device,
+            reference_manager=reference_manager,
+        ):
+            logger.mark_event(
+                json.dumps(
+                    {
+                        "gradient_reference_bootstrapped": {
+                            "path": str(reference_manager.reference_path),
+                            "source": "clean_loader_first_batch",
+                        }
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            logger.update_state(**reference_manager.empty_state())
 
     # Training
     global_step = 0
@@ -1355,6 +1670,8 @@ def main() -> None:
                 device=device,
                 logger=logger,
                 reference_manager=reference_manager,
+                occupancy_dir=occupancy_dir,
+                save_occupancy_snapshots=bool(args.save_occupancy_snapshots),
                 epoch=epoch,
                 global_step_start=global_step,
                 bg_cfg=bg_cfg,

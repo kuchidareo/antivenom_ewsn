@@ -1,7 +1,7 @@
 """Batch runner for feasibility experiments.
 
     Runs ml_running.py for:
-- clean (poison-type=clean, from disk)
+- clean (maps to poison-type=none, using the clean HF dataset)
 - blurring
 - occlusion
 - label-flip
@@ -130,6 +130,7 @@ def run_one(mode: str, args: argparse.Namespace) -> None:
     """Run one experiment mode via subprocess."""
     here = Path(__file__).resolve().parent
     ml_script = here / ("sl_running.py" if args.train_mode == "sl" else "ml_running.py")
+    poison_type = "none" if mode == "clean" else mode
 
     log_dir = Path(args.log_root) / ("clean" if mode in ("none", "clean") else mode)
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -142,7 +143,7 @@ def run_one(mode: str, args: argparse.Namespace) -> None:
         "--data-root",
         args.data_root,
         "--poison-type",
-        mode,
+        poison_type,
         "--poison-frac",
         str(args.poison_frac),
         "--epochs",
