@@ -11,9 +11,10 @@ Data
   Each has JPEGs + metadata.jsonl.
 
 Poisoning usage
-- Choose one of: none | blurring | occlusion | label-flip
-- Training dataset becomes: clean_train + sampled(poison_train, poison_frac)
-  (i.e., concatenate clean + poison samples)
+- Choose one of: none | clean | blurring | occlusion | label-flip
+- `none` loads clean HF training data directly.
+- Other variants load the prepared directory under <data_root>/<variant>/ directly.
+- `--poison-frac` is used only to validate prepared metadata when available.
 
 Logging (important)
 - Writes ONE timestamped CSV: <log_dir>/<YYYYmmdd_HHMMSS>.csv
@@ -41,6 +42,7 @@ import shutil
 import subprocess
 import threading
 import time
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -51,7 +53,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import ConcatDataset, DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset
 
 # HF deps
 from datasets import ClassLabel, Dataset as HFDataset, DatasetDict, Image as HFImage, load_dataset
@@ -182,7 +184,7 @@ class CleanHFDataset(Dataset):
 
 
 class PoisonDiskDataset(Dataset):
-    """Loads poisoned samples from <variant>/metadata.jsonl and JPEGs.
+    """Loads prepared samples from <variant>/metadata.jsonl and JPEGs.
 
     Notes
     - Filenames created by data_preparing.py include split prefix: <split>_<hash>.jpg
@@ -194,6 +196,7 @@ class PoisonDiskDataset(Dataset):
         variant_dir: Path,
         split_name: str,
         tfm_cfg: TransformConfig,
+        expected_poison_frac: Optional[float] = None,
     ) -> None:
         self.variant_dir = variant_dir
         self.split_name = split_name
@@ -204,6 +207,7 @@ class PoisonDiskDataset(Dataset):
             raise FileNotFoundError(f"metadata.jsonl not found: {meta_path}")
 
         items: List[Tuple[str, int]] = []
+        seen_poison_fracs: set[float] = set()
         with open(meta_path, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
@@ -213,12 +217,28 @@ class PoisonDiskDataset(Dataset):
                 fname = rec["file"]
                 if not fname.startswith(f"{split_name}_"):
                     continue
+                poison_frac = rec.get("poison_frac")
+                if poison_frac is not None:
+                    try:
+                        seen_poison_fracs.add(round(float(poison_frac), 6))
+                    except (TypeError, ValueError):
+                        pass
                 items.append((fname, int(rec["label"])))
 
         if not items:
             raise RuntimeError(f"No items found for split='{split_name}' in {meta_path}")
 
         self.items = items
+        self.prepared_poison_fracs = seen_poison_fracs
+
+        if expected_poison_frac is not None and seen_poison_fracs:
+            expected = round(float(expected_poison_frac), 6)
+            if expected not in seen_poison_fracs:
+                warnings.warn(
+                    f"Prepared metadata poison_frac={sorted(seen_poison_fracs)} does not match "
+                    f"requested --poison-frac={expected_poison_frac} for {meta_path}",
+                    stacklevel=2,
+                )
 
     def __len__(self) -> int:
         return len(self.items)
@@ -229,21 +249,6 @@ class PoisonDiskDataset(Dataset):
         img = Image.open(img_path)
         x = apply_transform(img, self.tfm_cfg)
         return x, y
-
-
-def sample_poison_dataset(poison_ds: Dataset, poison_frac: float, seed: int) -> Dataset:
-    if poison_frac <= 0:
-        return torch.utils.data.Subset(poison_ds, [])
-    if poison_frac >= 1:
-        return poison_ds
-
-    n = len(poison_ds)
-    k = max(1, int(n * poison_frac))
-    rng = random.Random(seed)
-    idxs = list(range(n))
-    rng.shuffle(idxs)
-    idxs = idxs[:k]
-    return torch.utils.data.Subset(poison_ds, idxs)
 
 
 def subsample_dataset(ds: Dataset, frac: float, seed: int) -> Dataset:
@@ -257,19 +262,6 @@ def subsample_dataset(ds: Dataset, frac: float, seed: int) -> Dataset:
     idxs = list(range(n))
     rng.shuffle(idxs)
     idxs = idxs[:k]
-    return torch.utils.data.Subset(ds, idxs)
-
-
-def sample_n_dataset(ds: Dataset, n: int, seed: int) -> Dataset:
-    if n <= 0:
-        return torch.utils.data.Subset(ds, [])
-    total = len(ds)
-    if n >= total:
-        return ds
-    rng = random.Random(seed)
-    idxs = list(range(total))
-    rng.shuffle(idxs)
-    idxs = idxs[:n]
     return torch.utils.data.Subset(ds, idxs)
 
 
@@ -1286,26 +1278,17 @@ def main() -> None:
     clean_test = subsample_dataset(clean_test, frac=float(args.test_frac), seed=args.seed + 1)
 
     train_ds: Dataset
-    target_n = len(clean_train)
     if args.poison_type == "none":
         train_ds = clean_train
-    elif args.poison_type == "clean":
-        variant_dir = Path(args.data_root) / "clean"
-        clean_disk = PoisonDiskDataset(variant_dir=variant_dir, split_name=train_split, tfm_cfg=tfm_cfg)
-        clean_disk = subsample_dataset(clean_disk, frac=float(args.train_frac), seed=args.seed + 2)
-        train_ds = sample_n_dataset(clean_disk, n=target_n, seed=args.seed + 3)
     else:
         variant_dir = Path(args.data_root) / args.poison_type
-        poison_train = PoisonDiskDataset(variant_dir=variant_dir, split_name=train_split, tfm_cfg=tfm_cfg)
-        poison_train = subsample_dataset(poison_train, frac=float(args.train_frac), seed=args.seed + 2)
-
-        poison_k = int(round(target_n * float(args.poison_frac)))
-        poison_k = max(0, min(poison_k, len(poison_train)))
-        clean_k = max(0, target_n - poison_k)
-
-        poison_sampled = sample_n_dataset(poison_train, n=poison_k, seed=args.seed)
-        clean_sampled = sample_n_dataset(clean_train, n=clean_k, seed=args.seed + 1)
-        train_ds = ConcatDataset([clean_sampled, poison_sampled])
+        prepared_train = PoisonDiskDataset(
+            variant_dir=variant_dir,
+            split_name=train_split,
+            tfm_cfg=tfm_cfg,
+            expected_poison_frac=float(args.poison_frac),
+        )
+        train_ds = subsample_dataset(prepared_train, frac=float(args.train_frac), seed=args.seed + 2)
 
     train_loader = DataLoader(
         train_ds,

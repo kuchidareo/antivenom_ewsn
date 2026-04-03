@@ -52,6 +52,7 @@ from tqdm import tqdm
 @dataclass(frozen=True)
 class PreprocessConfig:
     seed: int = 42
+    poison_frac: float = 1.0
 
     # Blurring (very strong by default)
     blur_radius: float = 12.0
@@ -280,6 +281,17 @@ def process_split(
     n = len(ds)
     limit = min(n, max_per_split) if max_per_split is not None else n
 
+    # Choose an exact subset per split to poison so the prepared directory can be
+    # loaded directly without additional clean/poison mixing at training time.
+    all_indices = list(range(limit))
+    variant_poisoned_indices: Dict[str, set[int]] = {}
+    for variant in ("blurring", "occlusion", "label-flip", "steganography"):
+        k = int(round(limit * cfg.poison_frac))
+        k = max(0, min(k, limit))
+        idxs = list(all_indices)
+        random.Random(cfg.seed + (hash((split_name, variant)) % 10_000)).shuffle(idxs)
+        variant_poisoned_indices[variant] = set(idxs[:k])
+
     clean_meta = out_root / "clean" / "metadata.jsonl"
     blur_meta = out_root / "blurring" / "metadata.jsonl"
     occ_meta = out_root / "occlusion" / "metadata.jsonl"
@@ -319,6 +331,10 @@ def process_split(
                 "file": filename,
                 "label": label,
                 "split": split_name,
+                "variant": "clean",
+                "poison_type": "clean",
+                "poison_applied": False,
+                "poison_frac": 0.0,
                 "orig_label": label,
                 "label_name": label_name,
             },
@@ -329,7 +345,8 @@ def process_split(
         file_id = stable_id(split_name, idx, v)
         filename = f"{split_name}_{file_id}.jpg"
         out_path = out_root / v / filename
-        out_img = apply_blurring(img, cfg)
+        blur_applied = idx in variant_poisoned_indices[v]
+        out_img = apply_blurring(img, cfg) if blur_applied else img
         save_jpeg(out_img, out_path)
         append_jsonl(
             blur_meta,
@@ -337,6 +354,10 @@ def process_split(
                 "file": filename,
                 "label": label,
                 "split": split_name,
+                "variant": v,
+                "poison_type": v,
+                "poison_applied": blur_applied,
+                "poison_frac": cfg.poison_frac,
                 "orig_label": label,
                 "label_name": label_name,
             },
@@ -347,7 +368,8 @@ def process_split(
         file_id = stable_id(split_name, idx, v)
         filename = f"{split_name}_{file_id}.jpg"
         out_path = out_root / v / filename
-        out_img = apply_occlusion(img, cfg, rng=rng)
+        occ_applied = idx in variant_poisoned_indices[v]
+        out_img = apply_occlusion(img, cfg, rng=rng) if occ_applied else img
         save_jpeg(out_img, out_path)
         append_jsonl(
             occ_meta,
@@ -355,6 +377,10 @@ def process_split(
                 "file": filename,
                 "label": label,
                 "split": split_name,
+                "variant": v,
+                "poison_type": v,
+                "poison_applied": occ_applied,
+                "poison_frac": cfg.poison_frac,
                 "orig_label": label,
                 "label_name": label_name,
             },
@@ -365,7 +391,8 @@ def process_split(
         file_id = stable_id(split_name, idx, v)
         filename = f"{split_name}_{file_id}.jpg"
         out_path = out_root / v / filename
-        new_label = flip_label_random_other(label, n_classes=n_classes, rng=rng)
+        flip_applied = idx in variant_poisoned_indices[v]
+        new_label = flip_label_random_other(label, n_classes=n_classes, rng=rng) if flip_applied else label
         new_label_name = class_names[new_label] if 0 <= new_label < n_classes else str(new_label)
         save_jpeg(img, out_path)
         append_jsonl(
@@ -374,6 +401,10 @@ def process_split(
                 "file": filename,
                 "label": new_label,
                 "split": split_name,
+                "variant": v,
+                "poison_type": v,
+                "poison_applied": flip_applied,
+                "poison_frac": cfg.poison_frac,
                 "orig_label": label,
                 "orig_label_name": label_name,
                 "label_name": new_label_name,
@@ -385,7 +416,8 @@ def process_split(
         file_id = stable_id(split_name, idx, v)
         filename = f"{split_name}_{file_id}.jpg"
         out_path = out_root / v / filename
-        out_img = apply_steganography(img)
+        stego_applied = idx in variant_poisoned_indices[v]
+        out_img = apply_steganography(img) if stego_applied else img
         save_jpeg(out_img, out_path)
         append_jsonl(
             stego_meta,
@@ -393,6 +425,10 @@ def process_split(
                 "file": filename,
                 "label": label,
                 "split": split_name,
+                "variant": v,
+                "poison_type": v,
+                "poison_applied": stego_applied,
+                "poison_frac": cfg.poison_frac,
                 "orig_label": label,
                 "label_name": label_name,
             },
@@ -414,6 +450,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-per-split", type=int, default=None, help="Optional cap per split")
 
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument(
+        "--poison-frac",
+        type=float,
+        default=1.0,
+        help="Fraction of each non-clean variant split to actually poison; the rest remain clean.",
+    )
 
     # Blurring
     p.add_argument("--blur-radius", type=float, default=12.0, help="Gaussian blur radius (very strong default)")
@@ -439,6 +481,7 @@ def main() -> None:
 
     cfg = PreprocessConfig(
         seed=args.seed,
+        poison_frac=max(0.0, min(1.0, float(args.poison_frac))),
         blur_radius=args.blur_radius,
         occlusion_min_frac=args.occlusion_min_frac,
         occlusion_max_frac=args.occlusion_max_frac,
@@ -462,6 +505,7 @@ def main() -> None:
     print(f"Detected columns: image='{image_col}', label='{label_col}'")
     print(f"Output: {out_root.resolve()}")
     print(f"Variants: {list(VARIANTS)}")
+    print(f"Poison frac: {cfg.poison_frac}")
 
     for split_name, split_ds in ds_dict.items():
         process_split(
