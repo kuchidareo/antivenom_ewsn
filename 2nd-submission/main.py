@@ -54,6 +54,11 @@ def parse_args() -> argparse.Namespace:
     # Logging
     p.add_argument("--log-root", type=str, default="logs_batch")
     p.add_argument("--log-fps", type=float, default=1.0)
+    p.add_argument(
+        "--disable-perf",
+        action="store_true",
+        help="Disable perf-based metric collection in ml_running.py",
+    )
 
     # Subsampling
     p.add_argument("--train-frac", type=float, default=1.0, help="Fraction of train split to use (0..1)")
@@ -178,6 +183,8 @@ def run_one(mode: str, args: argparse.Namespace) -> None:
         cmd.extend(["--device", args.device])
     if args.model and args.train_mode == "fl":
         cmd.extend(["--model", args.model])
+    if args.disable_perf:
+        cmd.append("--disable-perf")
 
     print("\n=== Running ===")
     print(" ".join(cmd))

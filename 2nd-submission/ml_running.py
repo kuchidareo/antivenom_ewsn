@@ -18,7 +18,9 @@ Poisoning usage
 Logging (important)
 - Writes ONE timestamped CSV: <log_dir>/<YYYYmmdd_HHMMSS>.csv
 - Logs at 1 FPS by default.
-- Captures interval metrics from `perf stat`.
+- Captures system metrics via psutil (CPU, mem, process usage, IO).
+- Captures interval metrics from `perf stat` unless disabled.
+- Best-effort CPU temperature (if available).
 - Training loop marks train_start/train_end events and only logs while training
   (logger disabled during evaluation by default).
 
@@ -31,7 +33,6 @@ import argparse
 import csv
 import datetime as dt
 import json
-import math
 import os
 import platform
 import random
@@ -58,6 +59,8 @@ from datasets import ClassLabel, Dataset as HFDataset, DatasetDict, Image as HFI
 # Image deps
 from PIL import Image
 
+# System metrics
+import psutil
 from tqdm import tqdm
 
 
@@ -469,34 +472,25 @@ class PerfCollector(MetricsCollector):
                     proc.terminate()
             except Exception:
                 pass
-        if self._reader is not None:
-            self._reader.join(timeout=5.0)
+        reader = self._reader
+        if reader is not None:
+            reader.join(timeout=3.0)
+        proc = self._proc
         if proc is not None:
             try:
                 if proc.poll() is None:
                     proc.kill()
+                proc.wait(timeout=1.0)
             except Exception:
                 pass
         self._reader = None
         self._proc = None
 
-    def _publish_pending_row(self) -> None:
-        if self._pending_ts is None:
-            return
-        row = self._empty_row()
-        row.update(self._pending_row)
-        row["perf_status"] = "ok"
-        row["perf_error"] = ""
-        row["perf_time_ms"] = self._parse_value(self._pending_ts)
+    def collect(self) -> Dict[str, Any]:
         with self._lock:
-            self._latest = row
-        self._pending_ts = None
-        self._pending_row = {}
+            return dict(self._latest)
 
-    def _handle_error_line(self, line: str) -> None:
-        msg = line.strip()
-        if not msg:
-            return
+    def _set_error(self, msg: str) -> None:
         with self._lock:
             self._latest["perf_status"] = "error"
             self._latest["perf_error"] = msg
@@ -504,481 +498,185 @@ class PerfCollector(MetricsCollector):
     def _read_loop(self) -> None:
         proc = self._proc
         if proc is None or proc.stderr is None:
+            self._set_error("perf process missing stderr")
             return
-
-        for raw_line in proc.stderr:
-            line = raw_line.strip()
-            if not line:
-                continue
-            parsed = self._parse_perf_line(line)
-            if parsed is None:
-                if "not supported" in line.lower() or "permission" in line.lower() or "failed" in line.lower():
-                    self._handle_error_line(line)
-                continue
-            ts_key, event, value = parsed
-            if self._pending_ts is None:
-                self._pending_ts = ts_key
-            elif ts_key != self._pending_ts:
-                self._publish_pending_row()
-                self._pending_ts = ts_key
-            self._pending_row[self._column_name(event)] = value
-
-        self._publish_pending_row()
-        ret = proc.poll()
-        if ret not in (None, 0) and not self._stop_requested:
+        try:
+            for raw_line in proc.stderr:
+                if self._stop_requested:
+                    break
+                line = raw_line.strip()
+                if not line:
+                    continue
+                parsed = self._parse_perf_line(line)
+                if parsed is None:
+                    continue
+                ts_raw, event_name, value = parsed
+                with self._lock:
+                    if self._pending_ts is None:
+                        self._pending_ts = ts_raw
+                    if ts_raw != self._pending_ts:
+                        self._flush_pending_locked()
+                        self._pending_ts = ts_raw
+                    self._pending_row[self._column_name(event_name)] = value
             with self._lock:
-                self._latest["perf_status"] = "error"
-                if not self._latest.get("perf_error"):
-                    self._latest["perf_error"] = f"perf exited with code {ret}"
+                self._flush_pending_locked()
+        except Exception as exc:
+            self._set_error(f"{type(exc).__name__}: {exc}")
+        finally:
+            ret = proc.poll()
+            if ret is None:
+                return
+            if ret != 0 and not self._stop_requested:
+                with self._lock:
+                    self._latest["perf_status"] = "error"
+                    if not self._latest.get("perf_error"):
+                        self._latest["perf_error"] = f"perf exited with code {ret}"
 
     def _parse_perf_line(self, line: str) -> Optional[Tuple[str, str, Optional[float]]]:
-        parts = [part.strip() for part in line.split(",")]
-        if len(parts) < 4:
+        if line.startswith("#"):
             return None
-        event_idx = None
-        for idx, part in enumerate(parts):
-            if part in self.event_set:
-                event_idx = idx
-                break
-        if event_idx is None or event_idx < 1:
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 3:
             return None
+        ts_raw = parts[0]
+        value_raw = parts[1]
+        event_name = parts[2]
+        if not ts_raw or event_name not in self.event_set:
+            return None
+        return ts_raw, event_name, self._parse_value(value_raw)
 
-        ts_key = parts[0]
-        event = parts[event_idx]
-        value = self._parse_value(parts[1])
-        return ts_key, event, value
+    def _flush_pending_locked(self) -> None:
+        if self._pending_ts is None:
+            return
+        row = self._empty_row()
+        row.update(self._pending_row)
+        row["perf_status"] = "ok"
+        row["perf_error"] = ""
+        row["perf_time_ms"] = self._parse_value(self._pending_ts)
+        self._latest = row
+        self._pending_ts = None
+        self._pending_row = {}
+
+
+class SystemCollector(MetricsCollector):
+    def __init__(self, proc: psutil.Process) -> None:
+        self.proc = proc
+        self._last_disk = None
+        self._last_ts = None
+
+        # warm-up for cpu_percent
+        psutil.cpu_percent(interval=None)
+        self.proc.cpu_percent(interval=None)
+
+    @staticmethod
+    def _cpu_temperature_c() -> Optional[float]:
+        # Best-effort: Linux via psutil or /sys; other OS may return None.
+        try:
+            temps = psutil.sensors_temperatures(fahrenheit=False)  # type: ignore[attr-defined]
+            if temps:
+                # Prefer common keys
+                for key in ("coretemp", "k10temp", "cpu_thermal", "soc_thermal"):
+                    if key in temps and temps[key]:
+                        vals = [t.current for t in temps[key] if t.current is not None]
+                        if vals:
+                            return float(np.mean(vals))
+                # Fallback: first available
+                for entries in temps.values():
+                    vals = [t.current for t in entries if t.current is not None]
+                    if vals:
+                        return float(np.mean(vals))
+        except Exception:
+            pass
+
+        # /sys fallback
+        try:
+            base = Path("/sys/class/thermal")
+            if base.exists():
+                temps = []
+                for p in base.glob("thermal_zone*/temp"):
+                    try:
+                        raw = p.read_text().strip()
+                        if raw:
+                            v = float(raw)
+                            # Often millidegrees
+                            if v > 1000:
+                                v = v / 1000.0
+                            temps.append(v)
+                    except Exception:
+                        continue
+                if temps:
+                    return float(np.mean(temps))
+        except Exception:
+            pass
+
+        return None
 
     def collect(self) -> Dict[str, Any]:
         now = dt.datetime.now(dt.timezone.utc)
-        with self._lock:
-            row = dict(self._latest)
-        row["ts_iso"] = now.isoformat()
-        row["ts_unix"] = now.timestamp()
-        return row
+        now_ts = now.timestamp()
 
+        # CPU
+        cpu_total = psutil.cpu_percent(interval=None)
+        cpu_per_core = psutil.cpu_percent(interval=None, percpu=True)
 
-class TensorReferenceManager:
-    def __init__(
-        self,
-        model: nn.Module,
-        root_dir: Path,
-        dataset: str,
-        model_name: str,
-        poison_type: str,
-        save_reference: bool = False,
-    ) -> None:
-        self.model = model
-        self.root_dir = root_dir
-        self.dataset = dataset
-        self.model_name = model_name
-        self.poison_type = poison_type
-        self.save_reference = save_reference
-        self.reference_dir = self.root_dir / "gradient_reference"
-        dataset_key = self._sanitize_name(dataset.replace("/", "_"))
-        self.reference_path = self.reference_dir / f"{self._sanitize_name(model_name)}_{dataset_key}.pt"
-        if self.save_reference or self.reference_path.exists():
-            self.reference_dir.mkdir(parents=True, exist_ok=True)
+        # Memory
+        vm = psutil.virtual_memory()
+        sm = psutil.swap_memory()
 
-        self.layer_modules: List[Tuple[str, nn.Module]] = []
-        self.forward_column_map: Dict[str, str] = {}
-        self.backward_column_map: Dict[str, str] = {}
-        self.forward_cosine_column_map: Dict[str, str] = {}
-        self.backward_cosine_column_map: Dict[str, str] = {}
-        self.forward_sparsity_column_map: Dict[str, str] = {}
-        self.backward_sparsity_column_map: Dict[str, str] = {}
-        self._forward_handles: List[Any] = []
-        self._backward_handles: List[Any] = []
-        self._current_forward: Dict[str, torch.Tensor] = {}
-        self._current_backward: Dict[str, torch.Tensor] = {}
-        self._current_forward_sparsity: Dict[str, float] = {}
-        self._current_backward_sparsity: Dict[str, float] = {}
-        self._current_forward_cacheline_map: Dict[str, torch.Tensor] = {}
-        self._current_forward_page_map: Dict[str, torch.Tensor] = {}
-        self._current_backward_cacheline_map: Dict[str, torch.Tensor] = {}
-        self._current_backward_page_map: Dict[str, torch.Tensor] = {}
-        self._current_forward_spatial_map: Dict[str, torch.Tensor] = {}
-        self._current_backward_spatial_map: Dict[str, torch.Tensor] = {}
-        self.reference_forward: Dict[str, torch.Tensor] = {}
-        self.reference_backward: Dict[str, torch.Tensor] = {}
-        self.reference_loaded = False
-        self.reference_saved_this_run = False
-        self.reference_layer_names: List[str] = []
-        self.sparsity_tau = 1e-8
+        # Process
+        p_cpu = self.proc.cpu_percent(interval=None)
+        try:
+            p_mem = self.proc.memory_info().rss
+        except Exception:
+            p_mem = None
 
-        for name, module in self.model.named_modules():
-            params = list(module.parameters(recurse=False))
-            if not name or not params:
-                continue
-            self.layer_modules.append((name, module))
-            safe = self._sanitize_name(name)
-            self.forward_column_map[name] = f"forward_rmse_{safe}"
-            self.backward_column_map[name] = f"backward_rmse_{safe}"
-            self.forward_cosine_column_map[name] = f"forward_cosine_{safe}"
-            self.backward_cosine_column_map[name] = f"backward_cosine_{safe}"
-            self.forward_sparsity_column_map[name] = f"forward_sparsity_{safe}"
-            self.backward_sparsity_column_map[name] = f"backward_sparsity_{safe}"
+        temp_c = self._cpu_temperature_c()
 
-        self.reference_layer_names = [name for name, _ in self.layer_modules]
-        self._load_reference()
-        self._register_hooks()
-
-    @staticmethod
-    def _sanitize_name(name: str) -> str:
-        sanitized = re.sub(r"[^0-9a-zA-Z_]+", "_", name)
-        return sanitized.strip("_").lower() or "layer"
-
-    @staticmethod
-    def _first_tensor(obj: Any) -> Optional[torch.Tensor]:
-        if torch.is_tensor(obj):
-            return obj
-        if isinstance(obj, (list, tuple)):
-            for item in obj:
-                found = TensorReferenceManager._first_tensor(item)
-                if found is not None:
-                    return found
-        if isinstance(obj, dict):
-            for item in obj.values():
-                found = TensorReferenceManager._first_tensor(item)
-                if found is not None:
-                    return found
-        return None
-
-    @staticmethod
-    def _vectorize_tensor(tensor: torch.Tensor) -> torch.Tensor:
-        return tensor.detach().float().cpu().reshape(-1).clone()
-
-    @staticmethod
-    def _to_batched_tensor(obj: Any) -> Optional[torch.Tensor]:
-        if not torch.is_tensor(obj):
-            return None
-        if obj.dim() == 0:
-            return obj.view(1, 1)
-        if obj.dim() == 1:
-            return obj.unsqueeze(0)
-        return obj
-
-    @staticmethod
-    def _block_active_counts_per_sample(x_sample_flat: torch.Tensor, tau: float = 1e-6, block_bytes: int = 64) -> torch.Tensor:
-        elem_size = x_sample_flat.element_size()
-        elems_per_block = max(1, block_bytes // elem_size)
-        active = (x_sample_flat.abs() > tau).to(torch.float32)
-        n = active.numel()
-        num_blocks = math.ceil(n / elems_per_block)
-        pad = num_blocks * elems_per_block - n
-        if pad > 0:
-            active = torch.cat([active, torch.zeros(pad, dtype=active.dtype, device=active.device)], dim=0)
-        return active.view(num_blocks, elems_per_block).sum(dim=1)
-
-    @staticmethod
-    def _pad_and_stack(vectors: list[torch.Tensor]) -> Optional[torch.Tensor]:
-        if not vectors:
-            return None
-        max_len = max(v.numel() for v in vectors)
-        out = []
-        for vec in vectors:
-            if vec.numel() < max_len:
-                pad = torch.zeros(max_len - vec.numel(), dtype=vec.dtype, device=vec.device)
-                vec = torch.cat([vec, pad], dim=0)
-            out.append(vec.unsqueeze(0))
-        return torch.cat(out, dim=0)
-
-    def _avg_block_activity_vector(self, output: Any, block_bytes: int) -> Optional[torch.Tensor]:
-        tensor = self._first_tensor(output)
-        if tensor is None:
-            return None
-        batched = self._to_batched_tensor(tensor)
-        if batched is None:
-            return None
-        batched = batched.detach()
-        vectors: list[torch.Tensor] = []
-        for idx in range(batched.shape[0]):
-            flat = batched[idx].reshape(-1)
-            vectors.append(self._block_active_counts_per_sample(flat, tau=1e-6, block_bytes=block_bytes))
-        mat = self._pad_and_stack(vectors)
-        if mat is None:
-            return None
-        return mat.mean(dim=0).detach().cpu()
-
-    @staticmethod
-    def _spatial_activity_map(output: Any) -> Optional[torch.Tensor]:
-        tensor = TensorReferenceManager._first_tensor(output)
-        if tensor is None:
-            return None
-        tensor = tensor.detach().float()
-        if tensor.dim() >= 4:
-            spatial = tensor.abs().mean(dim=0).mean(dim=0)
-        elif tensor.dim() == 3:
-            spatial = tensor.abs().mean(dim=0)
-        elif tensor.dim() == 2:
-            spatial = tensor.abs().mean(dim=0, keepdim=True)
-        elif tensor.dim() == 1:
-            spatial = tensor.abs().unsqueeze(0)
-        elif tensor.dim() == 0:
-            spatial = tensor.abs().view(1, 1)
+        # Disk IO (system-wide counters)
+        disk = psutil.disk_io_counters()
+        if disk is not None:
+            read_bytes = disk.read_bytes
+            write_bytes = disk.write_bytes
+            read_count = disk.read_count
+            write_count = disk.write_count
         else:
-            return None
-        return spatial.detach().cpu()
+            read_bytes = write_bytes = read_count = write_count = None
 
-    @staticmethod
-    def _tensor_sparsity(tensor: torch.Tensor, tau: float = 1e-8) -> float:
-        if tensor is None or tensor.numel() == 0:
-            return 0.0
-        tensor = tensor.detach()
-        return float((tensor.abs() <= tau).float().mean().item())
-
-    @classmethod
-    def _extract_tensor_sparsity(cls, obj: Any, tau: float = 1e-8) -> float:
-        if torch.is_tensor(obj):
-            return cls._tensor_sparsity(obj, tau)
-        if isinstance(obj, (tuple, list)):
-            total_zeros = 0
-            total_elems = 0
-            for item in obj:
-                if torch.is_tensor(item):
-                    item = item.detach()
-                    total_zeros += int((item.abs() <= tau).sum().item())
-                    total_elems += int(item.numel())
-            return float(total_zeros / total_elems) if total_elems > 0 else 0.0
-        return 0.0
-
-    @staticmethod
-    def _rmse(current: torch.Tensor, reference: torch.Tensor) -> Optional[float]:
-        if current.numel() != reference.numel():
-            return None
-        diff = current - reference
-        return float(torch.sqrt(torch.mean(diff * diff)).item())
-
-    @staticmethod
-    def _cosine_similarity(current: torch.Tensor, reference: torch.Tensor) -> Optional[float]:
-        if current.numel() != reference.numel():
-            return None
-        current_norm = torch.linalg.vector_norm(current)
-        reference_norm = torch.linalg.vector_norm(reference)
-        denom = current_norm * reference_norm
-        if float(denom.item()) == 0.0:
-            return None
-        return float(torch.dot(current, reference).div(denom).item())
-
-    def _load_reference(self) -> None:
-        if not self.reference_path.exists():
-            return
-        payload = torch.load(self.reference_path, map_location="cpu")
-        self.reference_forward = {
-            str(name): tensor.detach().float().cpu().reshape(-1)
-            for name, tensor in payload.get("forward", {}).items()
-            if torch.is_tensor(tensor)
-        }
-        self.reference_backward = {
-            str(name): tensor.detach().float().cpu().reshape(-1)
-            for name, tensor in payload.get("backward", {}).items()
-            if torch.is_tensor(tensor)
-        }
-        if self.reference_forward or self.reference_backward:
-            self.reference_loaded = True
-
-    def _register_hooks(self) -> None:
-        for name, module in self.layer_modules:
-            self._forward_handles.append(module.register_forward_hook(self._make_forward_hook(name)))
-            self._backward_handles.append(module.register_full_backward_hook(self._make_backward_hook(name)))
-
-    def close(self) -> None:
-        for handle in self._forward_handles:
-            handle.remove()
-        for handle in self._backward_handles:
-            handle.remove()
-        self._forward_handles = []
-        self._backward_handles = []
-
-    def _make_forward_hook(self, name: str):
-        def hook(module: nn.Module, inputs: Tuple[Any, ...], output: Any) -> None:
-            tensor = self._first_tensor(output)
-            if tensor is None:
-                return
-            self._current_forward[name] = self._vectorize_tensor(tensor)
-            self._current_forward_sparsity[name] = self._extract_tensor_sparsity(output, self.sparsity_tau)
-            cacheline_map = self._avg_block_activity_vector(output, block_bytes=64)
-            page_map = self._avg_block_activity_vector(output, block_bytes=4096)
-            if cacheline_map is not None:
-                self._current_forward_cacheline_map[name] = cacheline_map
-            if page_map is not None:
-                self._current_forward_page_map[name] = page_map
-            spatial_map = self._spatial_activity_map(output)
-            if spatial_map is not None:
-                self._current_forward_spatial_map[name] = spatial_map
-
-        return hook
-
-    def _make_backward_hook(self, name: str):
-        def hook(module: nn.Module, grad_input: Tuple[Any, ...], grad_output: Tuple[Any, ...]) -> None:
-            tensor = self._first_tensor(grad_output)
-            if tensor is None:
-                return
-            self._current_backward[name] = self._vectorize_tensor(tensor)
-            self._current_backward_sparsity[name] = self._extract_tensor_sparsity(grad_output, self.sparsity_tau)
-            cacheline_map = self._avg_block_activity_vector(grad_output, block_bytes=64)
-            page_map = self._avg_block_activity_vector(grad_output, block_bytes=4096)
-            if cacheline_map is not None:
-                self._current_backward_cacheline_map[name] = cacheline_map
-            if page_map is not None:
-                self._current_backward_page_map[name] = page_map
-            spatial_map = self._spatial_activity_map(grad_output)
-            if spatial_map is not None:
-                self._current_backward_spatial_map[name] = spatial_map
-
-        return hook
-
-    def reset_step(self) -> None:
-        self._current_forward = {}
-        self._current_backward = {}
-        self._current_forward_sparsity = {}
-        self._current_backward_sparsity = {}
-        self._current_forward_cacheline_map = {}
-        self._current_forward_page_map = {}
-        self._current_backward_cacheline_map = {}
-        self._current_backward_page_map = {}
-        self._current_forward_spatial_map = {}
-        self._current_backward_spatial_map = {}
-
-    def empty_state(self) -> Dict[str, Any]:
-        state: Dict[str, Any] = {
-            "rmse_status": "init",
-            "rmse_mismatch_layers": "",
-            "rmse_available_layers": 0,
-        }
-        for name in self.reference_layer_names:
-            state[self.forward_column_map[name]] = None
-            state[self.backward_column_map[name]] = None
-            state[self.forward_cosine_column_map[name]] = None
-            state[self.backward_cosine_column_map[name]] = None
-            state[self.forward_sparsity_column_map[name]] = None
-            state[self.backward_sparsity_column_map[name]] = None
-        return state
-
-    def maybe_save_reference(self) -> bool:
-        if not self.save_reference:
-            return False
-        if self.reference_loaded or self.reference_saved_this_run:
-            return False
-        if not self._current_forward or not self._current_backward:
-            return False
-        payload = {
-            "meta": {
-                "dataset": self.dataset,
-                "model": self.model_name,
-                "poison_type": self.poison_type,
-                "layer_names": list(self.reference_layer_names),
-            },
-            "forward": {name: tensor.clone() for name, tensor in self._current_forward.items()},
-            "backward": {name: tensor.clone() for name, tensor in self._current_backward.items()},
-        }
-        torch.save(payload, self.reference_path)
-        self.reference_forward = {name: tensor.clone() for name, tensor in self._current_forward.items()}
-        self.reference_backward = {name: tensor.clone() for name, tensor in self._current_backward.items()}
-        self.reference_loaded = True
-        self.reference_saved_this_run = True
-        return True
-
-    def compute_rmse_state(self) -> Dict[str, Any]:
-        state = self.empty_state()
-        if not self.reference_loaded:
-            state["rmse_status"] = "missing_reference"
-            return state
-        matched_layers = 0
-        mismatch_layers: List[str] = []
-        for name in self.reference_layer_names:
-            if name in self._current_forward_sparsity:
-                state[self.forward_sparsity_column_map[name]] = self._current_forward_sparsity[name]
-            if name in self._current_backward_sparsity:
-                state[self.backward_sparsity_column_map[name]] = self._current_backward_sparsity[name]
-
-            current_forward = self._current_forward.get(name)
-            reference_forward = self.reference_forward.get(name)
-            if current_forward is not None and reference_forward is not None:
-                value = self._rmse(current_forward, reference_forward)
-                state[self.forward_column_map[name]] = value
-                state[self.forward_cosine_column_map[name]] = self._cosine_similarity(current_forward, reference_forward)
-                if value is None:
-                    mismatch_layers.append(f"forward:{name}[{current_forward.numel()}!={reference_forward.numel()}]")
-                else:
-                    matched_layers += 1
-
-            current_backward = self._current_backward.get(name)
-            reference_backward = self.reference_backward.get(name)
-            if current_backward is not None and reference_backward is not None:
-                value = self._rmse(current_backward, reference_backward)
-                state[self.backward_column_map[name]] = value
-                state[self.backward_cosine_column_map[name]] = self._cosine_similarity(current_backward, reference_backward)
-                if value is None:
-                    mismatch_layers.append(f"backward:{name}[{current_backward.numel()}!={reference_backward.numel()}]")
-                else:
-                    matched_layers += 1
-        state["rmse_available_layers"] = matched_layers
-        if matched_layers > 0:
-            state["rmse_status"] = "ok"
-        elif mismatch_layers:
-            state["rmse_status"] = "shape_mismatch"
+        # Deltas since last sample
+        if self._last_disk is not None and self._last_ts is not None and disk is not None:
+            dt_sec = max(now_ts - self._last_ts, 1e-6)
+            read_bytes_delta = read_bytes - self._last_disk.read_bytes
+            write_bytes_delta = write_bytes - self._last_disk.write_bytes
+            read_bps = read_bytes_delta / dt_sec
+            write_bps = write_bytes_delta / dt_sec
         else:
-            state["rmse_status"] = "no_hook_data"
-        state["rmse_mismatch_layers"] = ";".join(mismatch_layers[:8])
-        return state
+            read_bytes_delta = write_bytes_delta = None
+            read_bps = write_bps = None
 
-    def save_occupancy_snapshot(self, output_dir: Path, *, epoch: int, step: int, global_step: int) -> Optional[Path]:
-        if (
-            not self._current_forward_cacheline_map
-            and not self._current_forward_page_map
-            and not self._current_backward_cacheline_map
-            and not self._current_backward_page_map
-        ):
-            return None
-        output_dir.mkdir(parents=True, exist_ok=True)
-        path = output_dir / f"epoch{epoch:03d}_step{step:05d}_global{global_step:05d}.pt"
-        payload = {
-            "meta": {
-                "epoch": int(epoch),
-                "step": int(step),
-                "global_step": int(global_step),
-            },
-            "forward_cacheline": {name: tensor.clone() for name, tensor in self._current_forward_cacheline_map.items()},
-            "forward_page": {name: tensor.clone() for name, tensor in self._current_forward_page_map.items()},
-            "backward_cacheline": {name: tensor.clone() for name, tensor in self._current_backward_cacheline_map.items()},
-            "backward_page": {name: tensor.clone() for name, tensor in self._current_backward_page_map.items()},
-            "forward_spatial": {name: tensor.clone() for name, tensor in self._current_forward_spatial_map.items()},
-            "backward_spatial": {name: tensor.clone() for name, tensor in self._current_backward_spatial_map.items()},
+        self._last_disk = disk
+        self._last_ts = now_ts
+
+        out: Dict[str, Any] = {
+            "ts_iso": now.isoformat(),
+            "ts_unix": now_ts,
+            "cpu_percent": cpu_total,
+            "cpu_per_core": json.dumps(cpu_per_core),
+            "mem_percent": vm.percent,
+            "swap_percent": sm.percent,
+            "proc_cpu_percent": p_cpu,
+            "proc_rss": p_mem,
+            "cpu_temp_c": temp_c,
+            "disk_read_bytes": read_bytes,
+            "disk_write_bytes": write_bytes,
+            "disk_read_count": read_count,
+            "disk_write_count": write_count,
+            "disk_read_bytes_delta": read_bytes_delta,
+            "disk_write_bytes_delta": write_bytes_delta,
+            "disk_read_bps": read_bps,
+            "disk_write_bps": write_bps,
         }
-        torch.save(payload, path)
-        return path
 
-
-def bootstrap_reference_from_clean_batch(
-    *,
-    model: nn.Module,
-    clean_loader: DataLoader,
-    device: torch.device,
-    reference_manager: TensorReferenceManager,
-) -> bool:
-    if reference_manager.reference_loaded:
-        return False
-
-    try:
-        x, y = next(iter(clean_loader))
-    except StopIteration:
-        return False
-
-    criterion = nn.CrossEntropyLoss()
-    was_training = model.training
-    reference_manager.reset_step()
-    model.zero_grad(set_to_none=True)
-    model.train()
-    x = x.to(device)
-    y = y.to(device)
-    logits = model(x)
-    loss = criterion(logits, y)
-    loss.backward()
-    saved = reference_manager.maybe_save_reference()
-    model.zero_grad(set_to_none=True)
-    if not was_training:
-        model.eval()
-    return saved
+        return out
 
 
 class CSVRunLogger:
@@ -1136,9 +834,6 @@ def train_one_epoch(
     optim: torch.optim.Optimizer,
     device: torch.device,
     logger: CSVRunLogger,
-    reference_manager: TensorReferenceManager,
-    occupancy_dir: Path,
-    save_occupancy_snapshots: bool,
     epoch: int,
     global_step_start: int,
     bg_cfg: Optional[Dict[str, Any]] = None,
@@ -1150,7 +845,6 @@ def train_one_epoch(
     global_step = global_step_start
     burst_steps: List[int] = []
     procs: List[subprocess.Popen] = []
-    occupancy_logged = False
 
     if bg_cfg is not None and int(bg_cfg.get("bursts_per_epoch", 0)) > 0:
         n_steps = len(loader)
@@ -1169,7 +863,6 @@ def train_one_epoch(
 
     pbar = tqdm(loader, desc=f"epoch {epoch}", leave=True)
     for step, (x, y) in enumerate(pbar):
-        reference_manager.reset_step()
         if bg_cfg is not None and burst_steps and step in burst_steps:
             cmd = [
                 "bash",
@@ -1209,8 +902,6 @@ def train_one_epoch(
         logits = model(x)
         loss = criterion(logits, y)
         loss.backward()
-        reference_saved = reference_manager.maybe_save_reference()
-        rmse_state = reference_manager.compute_rmse_state()
         optim.step()
 
         with torch.no_grad():
@@ -1219,48 +910,7 @@ def train_one_epoch(
 
         # Update logger state (will be sampled at 1 FPS)
         lr = float(optim.param_groups[0].get("lr", 0.0))
-        logger.update_state(
-            epoch=epoch,
-            step=step,
-            global_step=global_step,
-            loss=float(loss.item()),
-            lr=lr,
-            acc=acc,
-            **rmse_state,
-        )
-        if save_occupancy_snapshots:
-            occupancy_path = reference_manager.save_occupancy_snapshot(
-                occupancy_dir,
-                epoch=epoch,
-                step=step,
-                global_step=global_step,
-            )
-            if occupancy_path is not None and not occupancy_logged:
-                logger.mark_event(
-                    json.dumps(
-                        {
-                            "occupancy_snapshot_dir": {
-                                "path": str(occupancy_dir),
-                                "example_file": str(occupancy_path),
-                            }
-                        },
-                        ensure_ascii=False,
-                    )
-                )
-                occupancy_logged = True
-        if reference_saved:
-            logger.mark_event(
-                json.dumps(
-                    {
-                        "gradient_reference_saved": {
-                            "path": str(reference_manager.reference_path),
-                            "epoch": epoch,
-                            "step": step,
-                        }
-                    },
-                    ensure_ascii=False,
-                )
-            )
+        logger.update_state(epoch=epoch, step=step, global_step=global_step, loss=float(loss.item()), lr=lr, acc=acc)
         pbar.set_postfix(loss=f"{loss.item():.4f}", acc=f"{acc:.3f}", lr=f"{lr:.2e}")
 
         global_step += 1
@@ -1417,14 +1067,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--log-dir", type=str, default="logs")
     p.add_argument("--log-fps", type=float, default=1.0)
     p.add_argument(
-        "--save-gradient-reference",
+        "--disable-perf",
         action="store_true",
-        help="Write gradient reference tensors to gradient_reference/*.pt",
-    )
-    p.add_argument(
-        "--save-occupancy-snapshots",
-        action="store_true",
-        help="Write per-step occupancy .pt snapshots beside the CSV log",
+        help="Disable perf-based metric collection",
     )
 
     # Subsampling
@@ -1509,13 +1154,6 @@ def main() -> None:
         num_workers=args.num_workers,
         pin_memory=(device.type == "cuda"),
     )
-    clean_reference_loader = DataLoader(
-        clean_train,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=(device.type == "cuda"),
-    )
 
     test_loader = DataLoader(
         clean_test,
@@ -1531,23 +1169,16 @@ def main() -> None:
     else:
         model = SimpleCNN(n_classes=n_classes, img_size=int(img_size)).to(device)
     optim = torch.optim.Adam(model.parameters(), lr=float(args.lr))
-    repo_root = Path(__file__).resolve().parent.parent
-    reference_manager = TensorReferenceManager(
-        model=model,
-        root_dir=repo_root,
-        dataset=args.dataset,
-        model_name=args.model,
-        poison_type=args.poison_type,
-        save_reference=bool(args.save_gradient_reference),
-    )
 
     # Logger
     log_dir = Path(args.log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
     out_csv = log_dir / f"{_timestamp_name()}.csv"
-    occupancy_dir = log_dir / f"{out_csv.stem}_occupancy"
 
-    collectors: List[MetricsCollector] = [PerfCollector(pid=os.getpid(), fps=float(args.log_fps))]
+    proc = psutil.Process(os.getpid())
+    collectors: List[MetricsCollector] = [SystemCollector(proc)]
+    if not args.disable_perf:
+        collectors.append(PerfCollector(pid=os.getpid(), fps=float(args.log_fps)))
     logger = CSVRunLogger(out_csv=out_csv, fps=float(args.log_fps), collectors=collectors)
 
     # Record static run info once (as an event row)
@@ -1561,7 +1192,6 @@ def main() -> None:
         loss=None,
         lr=float(args.lr),
         acc=None,
-        **reference_manager.empty_state(),
     )
     logger.mark_event(
         json.dumps(
@@ -1586,17 +1216,13 @@ def main() -> None:
                     "python": platform.python_version(),
                     "torch": torch.__version__,
                     "model": args.model,
-                    "gradient_reference_path": str(reference_manager.reference_path),
-                    "gradient_reference_loaded": bool(reference_manager.reference_loaded),
-                    "save_gradient_reference": bool(args.save_gradient_reference),
+                    "disable_perf": bool(args.disable_perf),
                     "background_script": args.background_script,
                     "background_bursts_per_epoch": int(args.background_bursts_per_epoch),
                     "background_burst_on_sec": int(args.background_burst_on_sec),
                     "background_burst_threads": int(args.background_burst_threads),
                     "background_mode": args.background_mode,
                     "background_once_sec": int(args.background_once_sec),
-                    "save_occupancy_snapshots": bool(args.save_occupancy_snapshots),
-                    "occupancy_dir": str(occupancy_dir) if args.save_occupancy_snapshots else None,
                 }
             },
             ensure_ascii=False,
@@ -1607,26 +1233,6 @@ def main() -> None:
     print(f"dataset={args.dataset} split=({train_split},{test_split}) poison={args.poison_type} frac={args.poison_frac}")
     print(f"img_size={img_size} normalize={args.normalize} n_classes={n_classes} device={device}")
     print(f"log_csv={out_csv}")
-
-    if reference_manager.save_reference and not reference_manager.reference_loaded:
-        if bootstrap_reference_from_clean_batch(
-            model=model,
-            clean_loader=clean_reference_loader,
-            device=device,
-            reference_manager=reference_manager,
-        ):
-            logger.mark_event(
-                json.dumps(
-                    {
-                        "gradient_reference_bootstrapped": {
-                            "path": str(reference_manager.reference_path),
-                            "source": "clean_loader_first_batch",
-                        }
-                    },
-                    ensure_ascii=False,
-                )
-            )
-            logger.update_state(**reference_manager.empty_state())
 
     # Training
     global_step = 0
@@ -1669,9 +1275,6 @@ def main() -> None:
                 optim=optim,
                 device=device,
                 logger=logger,
-                reference_manager=reference_manager,
-                occupancy_dir=occupancy_dir,
-                save_occupancy_snapshots=bool(args.save_occupancy_snapshots),
                 epoch=epoch,
                 global_step_start=global_step,
                 bg_cfg=bg_cfg,
@@ -1705,7 +1308,6 @@ def main() -> None:
                 logger.mark_event(json.dumps({"bg_once_end": {"status": "stopped"}}, ensure_ascii=False))
             except Exception:
                 pass
-        reference_manager.close()
         logger.stop()
 
 
