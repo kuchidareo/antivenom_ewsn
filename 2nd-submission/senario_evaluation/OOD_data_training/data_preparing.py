@@ -218,6 +218,11 @@ def stable_id(split: str, idx: int, variant: str) -> str:
     return hashlib.sha1(raw).hexdigest()[:16]
 
 
+def stable_seed(*parts: object) -> int:
+    raw = ":".join(str(part) for part in parts).encode("utf-8")
+    return int(hashlib.sha1(raw).hexdigest()[:8], 16)
+
+
 def save_jpeg(img: Image.Image, path: Path, quality: int = 95) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     img = ensure_rgb(img)
@@ -511,7 +516,7 @@ def process_ood_split(
     k_ood = max(0, min(limit, int(round(limit * ood_frac))))
 
     idxs = list(range(limit))
-    rng = random.Random(seed + (hash(("ood", split_name)) % 10_000))
+    rng = random.Random(seed + stable_seed("ood", split_name))
     rng.shuffle(idxs)
     ood_target_indices = set(idxs[:k_ood])
 
@@ -584,7 +589,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ood-dataset", type=str, default="Donghyun99/Oxford-Flower-102")
     p.add_argument("--ood-config", type=str, default=None, help="HF OOD dataset config name (if needed)")
     p.add_argument("--out", type=str, default="data", help="Output root directory")
-    p.add_argument("--max-per-split", type=int, default=None, help="Optional cap per split")
+    p.add_argument(
+        "--max-per-split",
+        type=int,
+        default=1000,
+        help="Number of examples to save per split for both clean and ood outputs.",
+    )
     p.add_argument("--img-size", type=int, default=224, help="Saved output image size")
 
     p.add_argument("--seed", type=int, default=42)
@@ -638,9 +648,17 @@ def main() -> None:
     print(f"Output: {out_root.resolve()}")
     print(f"Variants: {list(VARIANTS)}")
     print(f"OOD frac: {ood_frac}")
+    print(f"Max per split: {int(args.max_per_split)}")
     print(f"Image size: {int(args.img_size)}")
 
     for split_name, split_ds in ds_dict.items():
+        limit = min(len(split_ds), int(args.max_per_split))
+        ood_count = int(round(limit * ood_frac))
+        clean_count = limit - ood_count
+        print(
+            f"Preparing split='{split_name}' with total={limit}, "
+            f"ood_replacements={ood_count}, in_domain={clean_count}"
+        )
         process_clean_split(
             split_ds,
             split_name=split_name,
