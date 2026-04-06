@@ -115,8 +115,8 @@ def build_summary(
     df: pd.DataFrame,
     reference_group: str,
     reference_label: str,
-    template_group: str | None = None,
-    template_label: str | None = None,
+    template_group: str,
+    template_label: str,
     target_keys: set[tuple[str, str]] | None = None,
     bins: int = 50,
 ) -> pd.DataFrame:
@@ -216,23 +216,29 @@ def build_summary(
         "run_csv": ref_row["run_csv"],
     }
 
-    template_rows_by_epoch: dict[float, pd.Series] = {}
-    if template_group is not None and template_label is not None:
-        template_rows = summary_per_epoch[
-            (summary_per_epoch["source_group"] == template_group)
-            & (summary_per_epoch["source_label"] == template_label)
-        ]
-        if template_rows.empty:
-            raise ValueError(f"Template run not found: {template_group}:{template_label}")
-        if template_rows["epoch"].duplicated().any():
-            dup_epochs = sorted(template_rows.loc[template_rows["epoch"].duplicated(), "epoch"].unique())
-            raise ValueError(
-                f"Template run has duplicate epoch rows for: {dup_epochs}"
-            )
-        template_rows_by_epoch = {
-            float(template_row["epoch"]): template_row
-            for _, template_row in template_rows.iterrows()
-        }
+    ref_coupling = {idx: _ot_coupling_1d(ref[f"core_{idx}"], ref[f"core_{idx}"]) for idx in range(4)}
+    ref_mem_coupling = _ot_coupling_1d(ref["mem"], ref["mem"])
+
+    template_rows = summary[
+        (summary["source_group"] == template_group)
+        & (summary["source_label"] == template_label)
+    ]
+    if template_rows.empty:
+        raise ValueError(f"Template run not found: {template_group}:{template_label}")
+    if len(template_rows) > 1:
+        raise ValueError(f"Template run is ambiguous: {template_group}:{template_label}")
+    template_row = template_rows.iloc[0]
+
+    template_delta_by_core: dict[int, np.ndarray] = {}
+    for idx in range(4):
+        template_shape = np.array(json.loads(template_row[f"core{idx}_shape_mean"]), dtype=float)
+        ref_shape = np.asarray(ref[f"core_{idx}"], dtype=float)
+        template_coupling = _ot_coupling_1d(ref_shape, template_shape)
+        template_delta_by_core[idx] = (template_coupling - ref_coupling[idx]).ravel()
+
+    template_mem_shape = np.array(json.loads(template_row["mem_shape_mean"]), dtype=float)
+    template_mem_coupling = _ot_coupling_1d(np.asarray(ref["mem"], dtype=float), template_mem_shape)
+    template_delta_mem = (template_mem_coupling - ref_mem_coupling).ravel()
 
     rows: list[dict[str, Any]] = []
     for _, row in summary_per_epoch.iterrows():
@@ -241,36 +247,21 @@ def build_summary(
             continue
         if target_keys is not None and row_key not in target_keys:
             continue
-        template_row = template_rows_by_epoch.get(float(row["epoch"]))
-        use_template = (
-            template_row is not None
-            and row_key != (template_group, template_label)
-        )
         dists = []
         cos_sims = []
         for idx in range(4):
             shape = np.array(json.loads(row[f"core{idx}_shape_mean"]))
             dist = _wasserstein_1d(ref[f"core_{idx}"], shape)
             dists.append(dist)
-            delta = np.asarray(shape, dtype=float) - np.asarray(ref[f"core_{idx}"], dtype=float)
-            tmpl = None
-            if use_template:
-                template_shape = np.array(json.loads(template_row[f"core{idx}_shape_mean"]), dtype=float)
-                tmpl = template_shape - np.asarray(ref[f"core_{idx}"], dtype=float)
-            cos_val = _cosine_similarity(delta, tmpl) if tmpl is not None else float("nan")
+            coupling = _ot_coupling_1d(ref[f"core_{idx}"], shape)
+            delta = (coupling - ref_coupling[idx]).ravel()
+            cos_val = _cosine_similarity(delta, template_delta_by_core[idx])
             cos_sims.append(cos_val)
         mem_shape = np.array(json.loads(row["mem_shape_mean"]))
         mem_dist = _wasserstein_1d(ref["mem"], mem_shape)
-        mem_delta = np.asarray(mem_shape, dtype=float) - np.asarray(ref["mem"], dtype=float)
-        template_delta_mem = None
-        if use_template:
-            template_mem_shape = np.array(json.loads(template_row["mem_shape_mean"]), dtype=float)
-            template_delta_mem = template_mem_shape - np.asarray(ref["mem"], dtype=float)
-        mem_cos = (
-            _cosine_similarity(mem_delta, template_delta_mem)
-            if template_delta_mem is not None
-            else float("nan")
-        )
+        mem_coupling = _ot_coupling_1d(ref["mem"], mem_shape)
+        mem_delta = (mem_coupling - ref_mem_coupling).ravel()
+        mem_cos = _cosine_similarity(mem_delta, template_delta_mem)
         finite_cos = [v for v in cos_sims if np.isfinite(v)]
         core_cos_mean = float(np.mean(finite_cos)) if finite_cos else float("nan")
         rows.append(
@@ -278,8 +269,6 @@ def build_summary(
                 "device_id": row["device_id"],
                 "reference_group": reference_group,
                 "reference_label": reference_label,
-                "template_group": template_group,
-                "template_label": template_label,
                 "target_group": row["source_group"],
                 "target_label": row["source_label"],
                 "poisoning_type": row["poisoning_type"],
@@ -313,11 +302,7 @@ def build_summary(
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--reference", required=True, help="reference spec: group:label=/path/to.csv")
-    p.add_argument(
-        "--template",
-        default="",
-        help="template spec for cosine matching: group:label=/path/to.csv",
-    )
+    p.add_argument("--template", required=True, help="template spec: group:label=/path/to.csv")
     p.add_argument(
         "--run",
         action="append",
@@ -333,15 +318,10 @@ def main() -> None:
         raise ValueError("At least one --run must be provided.")
 
     reference_group, reference_label, _ = parse_run_spec(args.reference)
-    template_group = None
-    template_label = None
-    specs = list(args.run)
-    target_keys = {parse_run_spec(spec)[:2] for spec in args.run}
-    if args.template.strip():
-        template_group, template_label, _ = parse_run_spec(args.template)
-        template_key = (template_group, template_label)
-        if template_key != (reference_group, reference_label) and template_key not in target_keys:
-            specs.append(args.template)
+    template_group, template_label, _ = parse_run_spec(args.template)
+    parsed_runs = [parse_run_spec(spec) for spec in args.run]
+    specs = [args.template, *args.run]
+    target_keys = {(group, label) for group, label, _ in parsed_runs}
 
     df = load_logs(args.reference, specs, device_id=args.device_id)
     summary = build_summary(
