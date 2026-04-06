@@ -117,6 +117,7 @@ def build_summary(
     reference_label: str,
     template_group: str | None = None,
     template_label: str | None = None,
+    target_keys: set[tuple[str, str]] | None = None,
     bins: int = 50,
 ) -> pd.DataFrame:
     required = ["epoch", "ts_unix", "cpu_per_core", "mem_percent"]
@@ -215,52 +216,56 @@ def build_summary(
         "run_csv": ref_row["run_csv"],
     }
 
-    ref_coupling = {idx: _ot_coupling_1d(ref[f"core_{idx}"], ref[f"core_{idx}"]) for idx in range(4)}
-    ref_mem_coupling = _ot_coupling_1d(ref["mem"], ref["mem"])
-
-    template_delta_by_core: dict[int, np.ndarray] = {}
-    template_delta_mem: np.ndarray | None = None
+    template_rows_by_epoch: dict[float, pd.Series] = {}
     if template_group is not None and template_label is not None:
-        template_rows = summary[
-            (summary["source_group"] == template_group)
-            & (summary["source_label"] == template_label)
+        template_rows = summary_per_epoch[
+            (summary_per_epoch["source_group"] == template_group)
+            & (summary_per_epoch["source_label"] == template_label)
         ]
         if template_rows.empty:
             raise ValueError(f"Template run not found: {template_group}:{template_label}")
-        if len(template_rows) > 1:
-            raise ValueError(f"Template run is ambiguous: {template_group}:{template_label}")
-
-        template_row = template_rows.iloc[0]
-        for idx in range(4):
-            template_shape = np.array(json.loads(template_row[f"core{idx}_shape_mean"]), dtype=float)
-            ref_shape = np.array(ref[f"core_{idx}"], dtype=float)
-            gs_ref = ref_coupling[idx]
-            gs_template = _ot_coupling_1d(ref_shape, template_shape)
-            template_delta_by_core[idx] = (gs_template - gs_ref).ravel()
-
-        template_mem_shape = np.array(json.loads(template_row["mem_shape_mean"]), dtype=float)
-        gs_template_mem = _ot_coupling_1d(ref["mem"], template_mem_shape)
-        template_delta_mem = (gs_template_mem - ref_mem_coupling).ravel()
+        if template_rows["epoch"].duplicated().any():
+            dup_epochs = sorted(template_rows.loc[template_rows["epoch"].duplicated(), "epoch"].unique())
+            raise ValueError(
+                f"Template run has duplicate epoch rows for: {dup_epochs}"
+            )
+        template_rows_by_epoch = {
+            float(template_row["epoch"]): template_row
+            for _, template_row in template_rows.iterrows()
+        }
 
     rows: list[dict[str, Any]] = []
     for _, row in summary_per_epoch.iterrows():
+        row_key = (str(row["source_group"]), str(row["source_label"]))
         if row["source_group"] == reference_group and row["source_label"] == reference_label:
             continue
+        if target_keys is not None and row_key not in target_keys:
+            continue
+        template_row = template_rows_by_epoch.get(float(row["epoch"]))
+        use_template = (
+            template_row is not None
+            and row_key != (template_group, template_label)
+        )
         dists = []
         cos_sims = []
         for idx in range(4):
             shape = np.array(json.loads(row[f"core{idx}_shape_mean"]))
             dist = _wasserstein_1d(ref[f"core_{idx}"], shape)
             dists.append(dist)
-            coupling = _ot_coupling_1d(ref[f"core_{idx}"], shape)
-            delta = (coupling - ref_coupling[idx]).ravel()
-            tmpl = template_delta_by_core.get(idx)
+            delta = np.asarray(shape, dtype=float) - np.asarray(ref[f"core_{idx}"], dtype=float)
+            tmpl = None
+            if use_template:
+                template_shape = np.array(json.loads(template_row[f"core{idx}_shape_mean"]), dtype=float)
+                tmpl = template_shape - np.asarray(ref[f"core_{idx}"], dtype=float)
             cos_val = _cosine_similarity(delta, tmpl) if tmpl is not None else float("nan")
             cos_sims.append(cos_val)
         mem_shape = np.array(json.loads(row["mem_shape_mean"]))
         mem_dist = _wasserstein_1d(ref["mem"], mem_shape)
-        mem_coupling = _ot_coupling_1d(ref["mem"], mem_shape)
-        mem_delta = (mem_coupling - ref_mem_coupling).ravel()
+        mem_delta = np.asarray(mem_shape, dtype=float) - np.asarray(ref["mem"], dtype=float)
+        template_delta_mem = None
+        if use_template:
+            template_mem_shape = np.array(json.loads(template_row["mem_shape_mean"]), dtype=float)
+            template_delta_mem = template_mem_shape - np.asarray(ref["mem"], dtype=float)
         mem_cos = (
             _cosine_similarity(mem_delta, template_delta_mem)
             if template_delta_mem is not None
@@ -331,11 +336,11 @@ def main() -> None:
     template_group = None
     template_label = None
     specs = list(args.run)
+    target_keys = {parse_run_spec(spec)[:2] for spec in args.run}
     if args.template.strip():
         template_group, template_label, _ = parse_run_spec(args.template)
         template_key = (template_group, template_label)
-        run_keys = {parse_run_spec(spec)[:2] for spec in specs}
-        if template_key != (reference_group, reference_label) and template_key not in run_keys:
+        if template_key != (reference_group, reference_label) and template_key not in target_keys:
             specs.append(args.template)
 
     df = load_logs(args.reference, specs, device_id=args.device_id)
@@ -345,6 +350,7 @@ def main() -> None:
         reference_label=reference_label,
         template_group=template_group,
         template_label=template_label,
+        target_keys=target_keys,
         bins=int(args.bins),
     )
 
