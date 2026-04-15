@@ -12,6 +12,9 @@ import pandas as pd
 
 
 ROOT_DIR = Path(__file__).resolve().parent
+EXCLUDED_RUNS = {
+    ("adamw_weight_decay/clean", "20260411_171943"),
+}
 
 
 def _load_module(module_name: str, path: Path):
@@ -48,6 +51,7 @@ def _discover_cases(root: Path) -> dict[str, list[Path]]:
                 cases[name] = csvs
 
     for scenario_dir in sorted(p for p in root.iterdir() if p.is_dir()):
+        print(scenario_dir)
         if scenario_dir.name in {"baseclean", "baseblurring", "__pycache__"}:
             continue
         for poison_type in ("clean", "blurring"):
@@ -60,13 +64,22 @@ def _discover_cases(root: Path) -> dict[str, list[Path]]:
     return cases
 
 
+def _is_excluded_run(case_name: str, csv_path: Path) -> bool:
+    return (case_name, csv_path.stem) in EXCLUDED_RUNS
+
+
 def _make_spec(case_name: str, role: str, index: int, csv_path: Path) -> str:
     label = f"{role}_{index:02d}_{csv_path.stem}"
     return f"{case_name}:{label}={csv_path.resolve()}"
 
 
 def _ordered_case_names(cases: dict[str, list[Path]], min_runs: int) -> list[str]:
-    return [name for name in sorted(cases) if len(cases[name]) >= min_runs]
+    eligible = []
+    for name in sorted(cases):
+        filtered_csvs = [csv_path for csv_path in cases[name] if not _is_excluded_run(name, csv_path)]
+        if len(filtered_csvs) >= min_runs:
+            eligible.append(name)
+    return eligible
 
 
 def _scenario_name(case_name: str) -> str:
@@ -184,12 +197,17 @@ def _build_case_summary(
         raise ValueError(f"Base case '{base_case}' does not have at least 2 CSVs.")
 
     base_csvs = cases[base_case]
+    base_csvs = [csv_path for csv_path in base_csvs if not _is_excluded_run(base_case, csv_path)]
+    if len(base_csvs) < 2:
+        raise ValueError(f"Base case '{base_case}' does not have 2 non-excluded CSVs.")
+
     reference_spec = _make_spec(base_case, "reference", 0, base_csvs[0])
     template_spec = _make_spec(base_case, "template", 1, base_csvs[1])
 
     run_specs: list[str] = []
     for case_name in eligible_cases:
         csvs = cases[case_name]
+        csvs = [csv_path for csv_path in csvs if not _is_excluded_run(case_name, csv_path)]
         start_idx = 2 if case_name == base_case else 0
         for idx, csv_path in enumerate(csvs[start_idx:], start=start_idx):
             run_specs.append(_make_spec(case_name, "run", idx, csv_path))
@@ -245,6 +263,7 @@ def main() -> None:
     manifest_rows: list[dict[str, Any]] = []
 
     for base_case in base_cases:
+        base_csvs = [csv_path for csv_path in cases[base_case] if not _is_excluded_run(base_case, csv_path)]
         summary = _build_case_summary(base_case=base_case, cases=cases, bins=args.bins)
         csv_path = out_dir / f"{_slugify(base_case)}_compare.csv"
         summary.to_csv(csv_path, index=False)
@@ -258,8 +277,8 @@ def main() -> None:
         manifest_rows.append(
             {
                 "base_case": base_case,
-                "reference_csv": str(cases[base_case][0].resolve()),
-                "template_csv": str(cases[base_case][1].resolve()),
+                "reference_csv": str(base_csvs[0].resolve()),
+                "template_csv": str(base_csvs[1].resolve()),
                 "summary_csv": str(csv_path),
                 "plot_png": str(png_path),
                 "num_target_rows": len(summary),
