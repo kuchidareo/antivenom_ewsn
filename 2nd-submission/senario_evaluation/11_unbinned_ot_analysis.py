@@ -132,7 +132,7 @@ def _aggregate_run_measure(epoch_measures: list[dict[str, np.ndarray]]) -> dict[
 def _cost_matrix(ref: dict[str, np.ndarray], target: dict[str, np.ndarray]) -> np.ndarray:
     dt = ref["t"][:, None] - target["t"][None, :]
     dx = ref["x"][:, None] - target["x"][None, :]
-    return dt * dt + dx * dx
+    return 5 * dt * dt + dx * dx
 
 
 def _sinkhorn(
