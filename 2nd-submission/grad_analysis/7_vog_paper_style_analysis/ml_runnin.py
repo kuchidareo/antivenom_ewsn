@@ -34,6 +34,7 @@ import argparse
 import csv
 import datetime as dt
 import json
+import math
 import os
 import platform
 import random
@@ -43,9 +44,10 @@ import subprocess
 import threading
 import time
 import warnings
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, DefaultDict, Dict, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 
@@ -141,26 +143,470 @@ def save_model_grads(model: nn.Module, save_path: Path | str) -> None:
     torch.save(grads, save_path)
 
 
-def save_model_checkpoint(
-    model: nn.Module,
-    save_path: Path | str,
-    *,
-    optimizer: Optional[torch.optim.Optimizer] = None,
-    epoch: Optional[int] = None,
-    global_step: Optional[int] = None,
-    metrics: Optional[Dict[str, float]] = None,
-    run_info: Optional[Dict[str, Any]] = None,
-) -> None:
-    checkpoint: Dict[str, Any] = {
-        "model_state_dict": model.state_dict(),
-        "epoch": None if epoch is None else int(epoch),
-        "global_step": None if global_step is None else int(global_step),
-        "metrics": dict(metrics) if metrics is not None else {},
-        "run_info": dict(run_info) if run_info is not None else {},
-    }
-    if optimizer is not None:
-        checkpoint["optimizer_state_dict"] = optimizer.state_dict()
-    torch.save(checkpoint, save_path)
+def _append_csv_rows(path: Path, rows: List[Dict[str, Any]], fieldnames: Sequence[str]) -> None:
+    if not rows:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_header = not path.exists()
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        if write_header:
+            writer.writeheader()
+        for row in rows:
+            writer.writerow({key: row.get(key, "") for key in fieldnames})
+
+
+@dataclass(frozen=True)
+class VogProbeSample:
+    sample_id: int
+    dataset_index: int
+    x: torch.Tensor
+    y: int
+
+
+def build_vog_probe_samples(ds: Dataset, num_samples: int, seed: int) -> List[VogProbeSample]:
+    n = len(ds)
+    if n <= 0:
+        raise ValueError("Cannot build a VoG probe set from an empty dataset.")
+
+    k = min(max(1, int(num_samples)), n)
+    idxs = list(range(n))
+    rng = random.Random(seed)
+    rng.shuffle(idxs)
+    idxs = sorted(idxs[:k])
+
+    samples: List[VogProbeSample] = []
+    for sample_id, dataset_index in enumerate(idxs):
+        item = ds[dataset_index]
+        if not isinstance(item, tuple) or len(item) < 2:
+            raise TypeError(f"Expected dataset item to be (x, y), got {type(item)}")
+        x, y = item[0], item[1]
+        if not isinstance(x, torch.Tensor):
+            raise TypeError(f"Expected VoG probe input tensor, got {type(x)}")
+        samples.append(VogProbeSample(sample_id=sample_id, dataset_index=int(dataset_index), x=x.cpu(), y=int(y)))
+    return samples
+
+
+class VogGradientObserver:
+    """Collects paper-style fixed-input gradient trajectories for VoG.
+
+    The raw files allow exact post-run VoG:
+        sum_j Var_t(g_j)
+    for the same sample across observations. VoG uses input gradients dL/dx;
+    parameter/layer gradients are intentionally not saved here.
+    """
+
+    SAMPLE_FIELDS: Tuple[str, ...] = ("sample_id", "dataset_index", "target")
+    OBS_FIELDS: Tuple[str, ...] = (
+        "observation_id",
+        "epoch",
+        "step",
+        "global_step",
+        "sample_id",
+        "dataset_index",
+        "target",
+        "pred",
+        "loss",
+        "scope",
+        "layer",
+        "grad_norm",
+        "energy",
+        "num_grad_values",
+        "grad_file",
+    )
+    SUMMARY_FIELDS: Tuple[str, ...] = (
+        "sample_id",
+        "dataset_index",
+        "target",
+        "scope",
+        "layer",
+        "observation_count",
+        "first_global_step",
+        "last_global_step",
+        "vog_l2_population",
+        "vog_l2_sample",
+        "vog_total_variance_population",
+        "vog_total_variance_sample",
+        "vog_mean_variance_population",
+        "vog_mean_variance_sample",
+        "num_grad_values",
+        "grad_norm_mean",
+        "grad_norm_variance_population",
+        "loss_mean",
+        "loss_variance_population",
+    )
+    RANKING_FIELDS: Tuple[str, ...] = (
+        "observation_id",
+        "epoch",
+        "step",
+        "global_step",
+        "sample_id",
+        "dataset_index",
+        "target",
+        "observation_count",
+        "vog_score",
+        "rank",
+        "rank_fraction",
+        "top_percentile",
+        "in_top_1pct",
+        "in_top_5pct",
+        "in_top_10pct",
+    )
+    STABILITY_FIELDS: Tuple[str, ...] = (
+        "observation_id",
+        "epoch",
+        "step",
+        "global_step",
+        "top_percent",
+        "top_k",
+        "top_sample_ids",
+        "previous_overlap_count",
+        "previous_overlap_share",
+        "previous_jaccard",
+        "persistent_count",
+        "persistent_share",
+        "ever_top_count",
+        "ever_top_share",
+    )
+
+    def __init__(
+        self,
+        *,
+        out_dir: Path,
+        samples: Sequence[VogProbeSample],
+        device: torch.device,
+        save_gradients: bool = True,
+    ) -> None:
+        self.out_dir = out_dir
+        self.samples = list(samples)
+        self.device = device
+        self.save_gradients = bool(save_gradients)
+        self.observation_id = 0
+
+        self.grad_dir = self.out_dir / "gradients"
+        self.observations_csv = self.out_dir / "vog_observations.csv"
+        self.samples_csv = self.out_dir / "vog_probe_samples.csv"
+        self.summary_csv = self.out_dir / "vog_summary.csv"
+        self.rankings_csv = self.out_dir / "vog_rankings.csv"
+        self.stability_csv = self.out_dir / "vog_top_stability.csv"
+        self._global_norm_history: DefaultDict[int, List[float]] = defaultdict(list)
+        self._loss_history: DefaultDict[int, List[float]] = defaultdict(list)
+        self._top_history: DefaultDict[int, List[Set[int]]] = defaultdict(list)
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        self.grad_dir.mkdir(parents=True, exist_ok=True)
+        self._write_probe_samples()
+
+    def _write_probe_samples(self) -> None:
+        rows = [
+            {"sample_id": s.sample_id, "dataset_index": s.dataset_index, "target": s.y}
+            for s in self.samples
+        ]
+        if self.samples_csv.exists():
+            self.samples_csv.unlink()
+        _append_csv_rows(self.samples_csv, rows, self.SAMPLE_FIELDS)
+
+    def observe(self, model: nn.Module, *, epoch: int, step: Optional[int], global_step: int) -> int:
+        criterion = nn.CrossEntropyLoss()
+        was_training = model.training
+        model.eval()
+
+        obs_id = self.observation_id
+        obs_dir = self.grad_dir / f"obs_{obs_id:04d}_global_step_{int(global_step):06d}"
+        if self.save_gradients:
+            obs_dir.mkdir(parents=True, exist_ok=True)
+
+        rows: List[Dict[str, Any]] = []
+        for sample in self.samples:
+            model.zero_grad(set_to_none=True)
+
+            x = sample.x.unsqueeze(0).to(self.device).detach().clone()
+            x.requires_grad_(True)
+            y = torch.tensor([sample.y], dtype=torch.long, device=self.device)
+            logits = model(x)
+            loss = criterion(logits, y)
+            loss.backward()
+
+            pred = int(logits.detach().argmax(dim=1).item())
+            input_grad = x.grad.detach().cpu().float().clone() if x.grad is not None else torch.empty(0)
+            input_energy = float((input_grad * input_grad).sum().item())
+            input_numel = int(input_grad.numel())
+
+            grad_file = ""
+            if self.save_gradients:
+                grad_path = obs_dir / f"sample_{sample.sample_id:04d}.pt"
+                torch.save(
+                    {
+                        "observation_id": obs_id,
+                        "epoch": int(epoch),
+                        "step": None if step is None else int(step),
+                        "global_step": int(global_step),
+                        "sample_id": int(sample.sample_id),
+                        "dataset_index": int(sample.dataset_index),
+                        "target": int(sample.y),
+                        "pred": pred,
+                        "loss": float(loss.item()),
+                        "input_grad": input_grad,
+                    },
+                    grad_path,
+                )
+                grad_file = str(grad_path)
+
+            base_row = {
+                "observation_id": obs_id,
+                "epoch": int(epoch),
+                "step": "" if step is None else int(step),
+                "global_step": int(global_step),
+                "sample_id": int(sample.sample_id),
+                "dataset_index": int(sample.dataset_index),
+                "target": int(sample.y),
+                "pred": pred,
+                "loss": float(loss.item()),
+                "grad_file": grad_file,
+            }
+            self._global_norm_history[sample.sample_id].append(math.sqrt(input_energy))
+            self._loss_history[sample.sample_id].append(float(loss.item()))
+            rows.append(
+                {
+                    **base_row,
+                    "scope": "input",
+                    "layer": "",
+                    "grad_norm": math.sqrt(input_energy),
+                    "energy": input_energy,
+                    "num_grad_values": input_numel,
+                }
+            )
+
+        model.zero_grad(set_to_none=True)
+        if was_training:
+            model.train()
+
+        _append_csv_rows(self.observations_csv, rows, self.OBS_FIELDS)
+        ranking_info = self._log_rankings(obs_id=obs_id, epoch=epoch, step=step, global_step=global_step)
+        self._print_progress(
+            obs_id=obs_id,
+            epoch=epoch,
+            step=step,
+            global_step=global_step,
+            ranking_info=ranking_info,
+        )
+        self.observation_id += 1
+        return obs_id
+
+    def _log_rankings(
+        self,
+        *,
+        obs_id: int,
+        epoch: int,
+        step: Optional[int],
+        global_step: int,
+    ) -> Dict[str, Any]:
+        sample_by_id = {sample.sample_id: sample for sample in self.samples}
+        scored: List[Tuple[int, float]] = []
+        for sample in self.samples:
+            values = self._global_norm_history.get(sample.sample_id, [])
+            if len(values) >= 2:
+                scored.append((sample.sample_id, float(np.var(values))))
+
+        if not scored:
+            return {}
+
+        scored.sort(key=lambda item: (-item[1], item[0]))
+        n = len(scored)
+        thresholds = (1, 5, 10)
+        top_sets: Dict[int, Set[int]] = {
+            percent: {sample_id for sample_id, _ in scored[: max(1, int(math.ceil(n * percent / 100.0)))]}
+            for percent in thresholds
+        }
+
+        ranking_rows: List[Dict[str, Any]] = []
+        for rank_idx, (sample_id, score) in enumerate(scored, start=1):
+            sample = sample_by_id[sample_id]
+            top_percentile = 100.0 * rank_idx / max(n, 1)
+            ranking_rows.append(
+                {
+                    "observation_id": obs_id,
+                    "epoch": int(epoch),
+                    "step": "" if step is None else int(step),
+                    "global_step": int(global_step),
+                    "sample_id": int(sample.sample_id),
+                    "dataset_index": int(sample.dataset_index),
+                    "target": int(sample.y),
+                    "observation_count": len(self._global_norm_history[sample_id]),
+                    "vog_score": score,
+                    "rank": rank_idx,
+                    "rank_fraction": rank_idx / max(n, 1),
+                    "top_percentile": top_percentile,
+                    "in_top_1pct": int(sample_id in top_sets[1]),
+                    "in_top_5pct": int(sample_id in top_sets[5]),
+                    "in_top_10pct": int(sample_id in top_sets[10]),
+                }
+            )
+        _append_csv_rows(self.rankings_csv, ranking_rows, self.RANKING_FIELDS)
+
+        stability_rows: List[Dict[str, Any]] = []
+        stability_info: Dict[int, Dict[str, Any]] = {}
+        for percent in thresholds:
+            current = top_sets[percent]
+            history = self._top_history[percent]
+            previous = history[-1] if history else set()
+            previous_overlap = current & previous
+            previous_union = current | previous
+            all_sets = history + [current]
+            persistent = set.intersection(*all_sets) if all_sets else set()
+            ever_top = set.union(*all_sets) if all_sets else set()
+            top_k = max(1, int(math.ceil(n * percent / 100.0)))
+            row = {
+                "observation_id": obs_id,
+                "epoch": int(epoch),
+                "step": "" if step is None else int(step),
+                "global_step": int(global_step),
+                "top_percent": percent,
+                "top_k": top_k,
+                "top_sample_ids": " ".join(str(sample_id) for sample_id in sorted(current)),
+                "previous_overlap_count": len(previous_overlap),
+                "previous_overlap_share": (len(previous_overlap) / max(len(current), 1)) if history else "",
+                "previous_jaccard": (len(previous_overlap) / max(len(previous_union), 1)) if history else "",
+                "persistent_count": len(persistent),
+                "persistent_share": len(persistent) / max(len(current), 1),
+                "ever_top_count": len(ever_top),
+                "ever_top_share": len(ever_top) / max(top_k, 1),
+            }
+            stability_rows.append(row)
+            stability_info[percent] = row
+            history.append(set(current))
+
+        _append_csv_rows(self.stability_csv, stability_rows, self.STABILITY_FIELDS)
+        return {
+            "top_sample_id": scored[0][0],
+            "top_score": scored[0][1],
+            "stability": stability_info,
+        }
+
+    def _print_progress(
+        self,
+        *,
+        obs_id: int,
+        epoch: int,
+        step: Optional[int],
+        global_step: int,
+        ranking_info: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        variances = [float(np.var(values)) for values in self._global_norm_history.values() if len(values) >= 2]
+        step_text = "epoch_end" if step is None else str(step)
+
+        if variances:
+            if ranking_info:
+                stability = ranking_info.get("stability", {})
+                top10 = stability.get(10, {})
+                overlap = top10.get("previous_overlap_share", "")
+                overlap_text = "nan" if overlap == "" else f"{float(overlap):.3f}"
+                print(
+                    "[VoG-rank] "
+                    f"epoch={epoch} step={step_text} obs={obs_id} "
+                    f"top10_ids={top10.get('top_sample_ids', '')} "
+                    f"prev_overlap={overlap_text} "
+                    f"persistent={top10.get('persistent_count', 0)}/{top10.get('top_k', 0)}"
+                )
+        else:
+            print(
+                "[VoG-rank] "
+                f"epoch={epoch} step={step_text} obs={obs_id} "
+                "need_more_observations"
+            )
+
+    def summarize(self) -> None:
+        if not self.save_gradients:
+            return
+
+        rows: List[Dict[str, Any]] = []
+        sample_files: DefaultDict[int, List[Path]] = defaultdict(list)
+        for path in sorted(self.grad_dir.glob("obs_*/sample_*.pt")):
+            try:
+                sample_id = int(path.stem.split("_", 1)[1])
+            except (IndexError, ValueError):
+                continue
+            sample_files[sample_id].append(path)
+
+        for sample in self.samples:
+            files = sample_files.get(sample.sample_id, [])
+            if len(files) < 2:
+                continue
+            rows.extend(self._summarize_sample(sample, files))
+
+        if self.summary_csv.exists():
+            self.summary_csv.unlink()
+        _append_csv_rows(self.summary_csv, rows, self.SUMMARY_FIELDS)
+
+    def _summarize_sample(self, sample: VogProbeSample, files: Sequence[Path]) -> List[Dict[str, Any]]:
+        layer_state: Dict[str, Dict[str, Any]] = {}
+        grad_norms: DefaultDict[Tuple[str, str], List[float]] = defaultdict(list)
+        losses: List[float] = []
+        global_steps: List[int] = []
+
+        for path in files:
+            rec = torch.load(path, map_location="cpu")
+            losses.append(float(rec.get("loss", float("nan"))))
+            global_steps.append(int(rec.get("global_step", -1)))
+
+            input_grad = rec.get("input_grad")
+            if isinstance(input_grad, torch.Tensor):
+                vec = input_grad.detach().float().reshape(-1)
+                energy = float((vec * vec).sum().item())
+                grad_norms[("input", "")].append(math.sqrt(energy))
+                state = layer_state.get("__input__")
+                if state is None:
+                    layer_state["__input__"] = {
+                        "count": 1,
+                        "mean": vec.clone(),
+                        "m2": torch.zeros_like(vec),
+                        "numel": int(vec.numel()),
+                    }
+                else:
+                    state["count"] += 1
+                    count = int(state["count"])
+                    delta = vec - state["mean"]
+                    state["mean"].add_(delta / count)
+                    delta2 = vec - state["mean"]
+                    state["m2"].add_(delta * delta2)
+
+        rows: List[Dict[str, Any]] = []
+
+        for key in sorted(layer_state):
+            state = layer_state[key]
+            count = int(state["count"])
+            if count < 2:
+                continue
+            m2 = state["m2"]
+            pop_total = float((m2 / count).sum().item())
+            sample_total = float((m2 / (count - 1)).sum().item())
+            numel = int(state["numel"])
+            norms = grad_norms[("input", "")]
+            rows.append(
+                {
+                    "sample_id": int(sample.sample_id),
+                    "dataset_index": int(sample.dataset_index),
+                    "target": int(sample.y),
+                    "scope": "input",
+                    "layer": "",
+                    "observation_count": count,
+                    "first_global_step": min(global_steps),
+                    "last_global_step": max(global_steps),
+                    "vog_l2_population": math.sqrt(max(pop_total, 0.0)),
+                    "vog_l2_sample": math.sqrt(max(sample_total, 0.0)),
+                    "vog_total_variance_population": pop_total,
+                    "vog_total_variance_sample": sample_total,
+                    "vog_mean_variance_population": pop_total / max(numel, 1),
+                    "vog_mean_variance_sample": sample_total / max(numel, 1),
+                    "num_grad_values": numel,
+                    "grad_norm_mean": float(np.mean(norms)) if norms else "",
+                    "grad_norm_variance_population": float(np.var(norms)) if len(norms) > 1 else "",
+                    "loss_mean": float(np.nanmean(losses)) if losses else "",
+                    "loss_variance_population": float(np.nanvar(losses)) if len(losses) > 1 else "",
+                }
+            )
+            del state["mean"]
+            del state["m2"]
+        return rows
 
 
 @dataclass(frozen=True)
@@ -733,8 +1179,10 @@ class CSVRunLogger:
             "step": None,
             "global_step": None,
             "loss": None,
+            "batch_loss": None,
             "lr": None,
             "acc": None,
+            "batch_acc": None,
         }
 
         self._header_written = False
@@ -755,6 +1203,19 @@ class CSVRunLogger:
     def mark_event(self, name: str) -> None:
         # Emit an immediate row containing an event marker.
         self._write_row(event=name)
+
+    def log_batch(self, *, epoch: int, step: int, global_step: int, loss: float, lr: float, acc: float) -> None:
+        self.update_state(
+            epoch=epoch,
+            step=step,
+            global_step=global_step,
+            loss=loss,
+            batch_loss=loss,
+            lr=lr,
+            acc=acc,
+            batch_acc=acc,
+        )
+        self._write_row(event="batch_end")
 
     def start(self) -> None:
         if self._thread is not None:
@@ -864,6 +1325,8 @@ def train_one_epoch(
     global_step_start: int,
     save_grad: bool = False,
     grad_log_dir: Optional[Path] = None,
+    vog_observer: Optional[VogGradientObserver] = None,
+    vog_every_steps: int = 0,
     bg_cfg: Optional[Dict[str, Any]] = None,
     seed: int = 0,
 ) -> int:
@@ -939,12 +1402,21 @@ def train_one_epoch(
             preds = logits.argmax(dim=1)
             acc = float((preds == y).float().mean().item())
 
-        # Update logger state (will be sampled at 1 FPS)
         lr = float(optim.param_groups[0].get("lr", 0.0))
-        logger.update_state(epoch=epoch, step=step, global_step=global_step, loss=float(loss.item()), lr=lr, acc=acc)
+        logger.log_batch(
+            epoch=epoch,
+            step=step,
+            global_step=global_step,
+            loss=float(loss.item()),
+            lr=lr,
+            acc=acc,
+        )
         pbar.set_postfix(loss=f"{loss.item():.4f}", acc=f"{acc:.3f}", lr=f"{lr:.2e}")
 
         global_step += 1
+        if vog_observer is not None and int(vog_every_steps) > 0 and global_step % int(vog_every_steps) == 0:
+            vog_observer.observe(model, epoch=epoch, step=step, global_step=global_step)
+            model.train()
 
     # Terminate any remaining background bursts at epoch end
     for proc in procs:
@@ -1103,12 +1575,6 @@ def parse_args() -> argparse.Namespace:
 
     # Logging
     p.add_argument("--log-dir", type=str, default="logs")
-    p.add_argument(
-        "--model-save-root",
-        type=str,
-        default="model_checkpoints",
-        help="Root directory for saving the final trained model checkpoint.",
-    )
     p.add_argument("--log-fps", type=float, default=1.0)
     p.add_argument(
         "--grad-log-root",
@@ -1122,16 +1588,55 @@ def parse_args() -> argparse.Namespace:
         help="Save all epoch/step gradients and keep them.",
     )
     p.add_argument(
-        "--grad-analysis-ref",
-        type=str,
-        default=None,
-        help=argparse.SUPPRESS,
+        "--vog-run",
+        action="store_true",
+        help="Enable fixed-input Variance of Gradients collection.",
     )
-    p.add_argument("--grad-analysis-csv", type=str, default=None, help=argparse.SUPPRESS)
-    p.add_argument("--grad-analysis-log-dir", type=str, default=None, help=argparse.SUPPRESS)
-    p.add_argument("--grad-analysis-eps", type=float, default=0.0, help=argparse.SUPPRESS)
-    p.add_argument("--grad-analysis-layers", type=str, nargs="*", default=None, help=argparse.SUPPRESS)
-    p.add_argument("--keep-grad-after-analysis", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument(
+        "--vog-log-root",
+        type=str,
+        default="vog_logs",
+        help="Root directory for fixed-input VoG outputs.",
+    )
+    p.add_argument(
+        "--vog-num-samples",
+        type=int,
+        default=8,
+        help="Number of fixed probe samples used for VoG.",
+    )
+    p.add_argument(
+        "--vog-seed",
+        type=int,
+        default=None,
+        help="Seed for choosing fixed VoG probe samples. Defaults to --seed.",
+    )
+    p.add_argument(
+        "--vog-probe-source",
+        type=str,
+        default="data-clean",
+        choices=["data-clean", "train", "clean-train", "clean-test"],
+        help="Dataset source for fixed VoG probe samples. Default uses <data-root>/clean.",
+    )
+    p.add_argument(
+        "--vog-every-steps",
+        type=int,
+        default=0,
+        help="Also collect VoG every N train steps. 0 means epoch boundaries only.",
+    )
+    p.add_argument(
+        "--no-vog-at-train-start",
+        action="store_false",
+        dest="vog_at_train_start",
+        help="Disable the initial VoG observation before the first optimizer step.",
+    )
+    p.set_defaults(vog_at_train_start=True)
+    p.add_argument(
+        "--no-vog-save-gradients",
+        action="store_false",
+        dest="vog_save_gradients",
+        help="Only save VoG observation CSV; disables exact vector VoG summary.",
+    )
+    p.set_defaults(vog_save_gradients=True)
     p.add_argument(
         "--disable-perf",
         action="store_true",
@@ -1233,18 +1738,46 @@ def main() -> None:
     # Logger
     log_dir = Path(args.log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
-    model_save_root = Path(args.model_save_root)
-    model_save_root.mkdir(parents=True, exist_ok=True)
     run_name = _timestamp_name()
     out_csv = log_dir / f"{run_name}.csv"
-    model_save_path = model_save_root / f"{run_name}_final.pt"
     grad_log_dir: Optional[Path] = None
-    save_gradients = bool(args.grad_reference_run) or bool(args.grad_analysis_ref)
-    if args.grad_analysis_ref:
-        print("warning: --grad-analysis-ref is deprecated and no analysis will run; saving gradients only.")
+    save_gradients = bool(args.grad_reference_run)
     if save_gradients:
         grad_log_dir = Path(args.grad_log_root) / run_name
         grad_log_dir.mkdir(parents=True, exist_ok=True)
+
+    vog_observer: Optional[VogGradientObserver] = None
+    vog_log_dir: Optional[Path] = None
+    if bool(args.vog_run):
+        vog_source = str(args.vog_probe_source)
+        if vog_source == "data-clean":
+            clean_variant_dir = Path(args.data_root) / "clean"
+            if not clean_variant_dir.exists():
+                raise FileNotFoundError(
+                    f"VoG probe source requires clean prepared data at {clean_variant_dir}. "
+                    "Set --data-root to the directory containing clean/."
+                )
+            vog_ds = PoisonDiskDataset(
+                variant_dir=clean_variant_dir,
+                split_name=train_split,
+                tfm_cfg=tfm_cfg,
+                expected_poison_frac=None,
+            )
+        elif vog_source == "clean-train":
+            vog_ds = clean_train
+        elif vog_source == "clean-test":
+            vog_ds = clean_test
+        else:
+            vog_ds = train_ds
+        vog_seed = int(args.seed if args.vog_seed is None else args.vog_seed)
+        vog_samples = build_vog_probe_samples(vog_ds, num_samples=int(args.vog_num_samples), seed=vog_seed)
+        vog_log_dir = Path(args.vog_log_root) / run_name
+        vog_observer = VogGradientObserver(
+            out_dir=vog_log_dir,
+            samples=vog_samples,
+            device=device,
+            save_gradients=bool(args.vog_save_gradients),
+        )
 
     proc = psutil.Process(os.getpid())
     collectors: List[MetricsCollector] = [SystemCollector(proc)]
@@ -1292,8 +1825,15 @@ def main() -> None:
                     "grad_reference_run": bool(args.grad_reference_run),
                     "grad_log_root": str(args.grad_log_root),
                     "grad_log_dir": str(grad_log_dir) if grad_log_dir is not None else None,
-                    "grad_analysis_disabled": True,
-                    "grad_analysis_ref_ignored": str(args.grad_analysis_ref) if args.grad_analysis_ref else None,
+                    "vog_run": bool(args.vog_run),
+                    "vog_log_root": str(args.vog_log_root),
+                    "vog_log_dir": str(vog_log_dir) if vog_log_dir is not None else None,
+                    "vog_num_samples": int(args.vog_num_samples),
+                    "vog_seed": int(args.seed if args.vog_seed is None else args.vog_seed),
+                    "vog_probe_source": str(args.vog_probe_source),
+                    "vog_every_steps": int(args.vog_every_steps),
+                    "vog_at_train_start": bool(args.vog_at_train_start),
+                    "vog_save_gradients": bool(args.vog_save_gradients),
                     "disable_perf": bool(args.disable_perf),
                     "background_script": args.background_script,
                     "background_bursts_per_epoch": int(args.background_bursts_per_epoch),
@@ -1313,19 +1853,21 @@ def main() -> None:
     print(f"log_csv={out_csv}")
     if grad_log_dir is not None:
         print(f"grad_log_dir={grad_log_dir}")
-    print(f"model_checkpoint={model_save_path}")
+    if vog_log_dir is not None:
+        print(f"vog_log_dir={vog_log_dir}")
 
     # Training
     global_step = 0
-    final_epoch = -1
-    last_epoch_test_loss: Optional[float] = None
-    last_epoch_test_acc: Optional[float] = None
     logger.enable()
     logger.mark_event("train_start")
 
     try:
         bg_cfg: Optional[Dict[str, Any]] = None
         bg_proc: Optional[subprocess.Popen] = None
+        if vog_observer is not None and bool(args.vog_at_train_start):
+            logger.mark_event("vog_observation_train_start")
+            vog_observer.observe(model, epoch=-1, step=None, global_step=global_step)
+            model.train()
         if args.background_script:
             bg_cfg = {
                 "script": str(args.background_script),
@@ -1363,14 +1905,17 @@ def main() -> None:
                 global_step_start=global_step,
                 save_grad=save_gradients,
                 grad_log_dir=grad_log_dir,
+                vog_observer=vog_observer,
+                vog_every_steps=int(args.vog_every_steps),
                 bg_cfg=bg_cfg,
                 seed=int(args.seed),
             )
+            if vog_observer is not None:
+                logger.mark_event(json.dumps({"vog_observation_epoch_end": {"epoch": epoch}}, ensure_ascii=False))
+                vog_observer.observe(model, epoch=epoch, step=None, global_step=global_step)
+                model.train()
 
             test_loss, test_acc = evaluate(model, test_loader, device=device)
-            final_epoch = epoch
-            last_epoch_test_loss = float(test_loss)
-            last_epoch_test_acc = float(test_acc)
             print(f"epoch={epoch} test_loss={test_loss:.4f} test_acc={test_acc:.4f}")
             logger.mark_event(
                 json.dumps(
@@ -1386,44 +1931,13 @@ def main() -> None:
         logger.mark_event("train_end")
         logger.disable()
 
-        save_model_checkpoint(
-            model,
-            model_save_path,
-            optimizer=optim,
-            epoch=final_epoch if final_epoch >= 0 else None,
-            global_step=global_step,
-            metrics={
-                "last_epoch_test_loss": float(last_epoch_test_loss) if last_epoch_test_loss is not None else float("nan"),
-                "last_epoch_test_acc": float(last_epoch_test_acc) if last_epoch_test_acc is not None else float("nan"),
-            },
-            run_info={
-                "run_name": run_name,
-                "dataset": args.dataset,
-                "config": args.config,
-                "poison_type": args.poison_type,
-                "poison_frac": float(args.poison_frac),
-                "img_size": int(img_size),
-                "normalize": args.normalize,
-                "epochs": int(args.epochs),
-                "batch_size": int(args.batch_size),
-                "lr": float(args.lr),
-                "optimizer": args.optimizer,
-                "seed": int(args.seed),
-                "device": str(device),
-                "model": args.model,
-                "dropout": float(args.dropout),
-                "train_split": train_split,
-                "test_split": test_split,
-                "log_csv": str(out_csv),
-                "grad_log_dir": str(grad_log_dir) if grad_log_dir is not None else None,
-            },
-        )
-        logger.mark_event(
-            json.dumps(
-                {"model_checkpoint": {"path": str(model_save_path), "epoch": final_epoch, "global_step": global_step}},
-                ensure_ascii=False,
-            )
-        )
+        if vog_observer is not None:
+            vog_observer.summarize()
+            if vog_observer.summary_csv.exists():
+                print(f"vog_summary_csv={vog_observer.summary_csv}")
+            print(f"vog_observations_csv={vog_observer.observations_csv}")
+            print(f"vog_rankings_csv={vog_observer.rankings_csv}")
+            print(f"vog_top_stability_csv={vog_observer.stability_csv}")
 
         # Evaluation (logger disabled by default)
         test_loss, test_acc = evaluate(model, test_loader, device=device)

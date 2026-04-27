@@ -29,7 +29,7 @@ def _load_module(module_name: str, path: Path):
 def _analysis_module():
     if str(ROOT_DIR) not in sys.path:
         sys.path.insert(0, str(ROOT_DIR))
-    return _load_module("scenario_analysis_mod", ROOT_DIR / "1_cpu_core_sorted_mem_baseclean_analysis.py")
+    return _load_module("scenario_analysis_mod", ROOT_DIR / "01_cpu_core_sorted_mem_baseclean_analysis.py")
 
 
 def _plot_module():

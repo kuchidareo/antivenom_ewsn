@@ -141,28 +141,6 @@ def save_model_grads(model: nn.Module, save_path: Path | str) -> None:
     torch.save(grads, save_path)
 
 
-def save_model_checkpoint(
-    model: nn.Module,
-    save_path: Path | str,
-    *,
-    optimizer: Optional[torch.optim.Optimizer] = None,
-    epoch: Optional[int] = None,
-    global_step: Optional[int] = None,
-    metrics: Optional[Dict[str, float]] = None,
-    run_info: Optional[Dict[str, Any]] = None,
-) -> None:
-    checkpoint: Dict[str, Any] = {
-        "model_state_dict": model.state_dict(),
-        "epoch": None if epoch is None else int(epoch),
-        "global_step": None if global_step is None else int(global_step),
-        "metrics": dict(metrics) if metrics is not None else {},
-        "run_info": dict(run_info) if run_info is not None else {},
-    }
-    if optimizer is not None:
-        checkpoint["optimizer_state_dict"] = optimizer.state_dict()
-    torch.save(checkpoint, save_path)
-
-
 @dataclass(frozen=True)
 class TransformConfig:
     img_size: int
@@ -733,8 +711,10 @@ class CSVRunLogger:
             "step": None,
             "global_step": None,
             "loss": None,
+            "batch_loss": None,
             "lr": None,
             "acc": None,
+            "batch_acc": None,
         }
 
         self._header_written = False
@@ -755,6 +735,19 @@ class CSVRunLogger:
     def mark_event(self, name: str) -> None:
         # Emit an immediate row containing an event marker.
         self._write_row(event=name)
+
+    def log_batch(self, *, epoch: int, step: int, global_step: int, loss: float, lr: float, acc: float) -> None:
+        self.update_state(
+            epoch=epoch,
+            step=step,
+            global_step=global_step,
+            loss=loss,
+            batch_loss=loss,
+            lr=lr,
+            acc=acc,
+            batch_acc=acc,
+        )
+        self._write_row(event="batch_end")
 
     def start(self) -> None:
         if self._thread is not None:
@@ -939,9 +932,15 @@ def train_one_epoch(
             preds = logits.argmax(dim=1)
             acc = float((preds == y).float().mean().item())
 
-        # Update logger state (will be sampled at 1 FPS)
         lr = float(optim.param_groups[0].get("lr", 0.0))
-        logger.update_state(epoch=epoch, step=step, global_step=global_step, loss=float(loss.item()), lr=lr, acc=acc)
+        logger.log_batch(
+            epoch=epoch,
+            step=step,
+            global_step=global_step,
+            loss=float(loss.item()),
+            lr=lr,
+            acc=acc,
+        )
         pbar.set_postfix(loss=f"{loss.item():.4f}", acc=f"{acc:.3f}", lr=f"{lr:.2e}")
 
         global_step += 1
@@ -1103,12 +1102,6 @@ def parse_args() -> argparse.Namespace:
 
     # Logging
     p.add_argument("--log-dir", type=str, default="logs")
-    p.add_argument(
-        "--model-save-root",
-        type=str,
-        default="model_checkpoints",
-        help="Root directory for saving the final trained model checkpoint.",
-    )
     p.add_argument("--log-fps", type=float, default=1.0)
     p.add_argument(
         "--grad-log-root",
@@ -1233,11 +1226,8 @@ def main() -> None:
     # Logger
     log_dir = Path(args.log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
-    model_save_root = Path(args.model_save_root)
-    model_save_root.mkdir(parents=True, exist_ok=True)
     run_name = _timestamp_name()
     out_csv = log_dir / f"{run_name}.csv"
-    model_save_path = model_save_root / f"{run_name}_final.pt"
     grad_log_dir: Optional[Path] = None
     save_gradients = bool(args.grad_reference_run) or bool(args.grad_analysis_ref)
     if args.grad_analysis_ref:
@@ -1313,13 +1303,9 @@ def main() -> None:
     print(f"log_csv={out_csv}")
     if grad_log_dir is not None:
         print(f"grad_log_dir={grad_log_dir}")
-    print(f"model_checkpoint={model_save_path}")
 
     # Training
     global_step = 0
-    final_epoch = -1
-    last_epoch_test_loss: Optional[float] = None
-    last_epoch_test_acc: Optional[float] = None
     logger.enable()
     logger.mark_event("train_start")
 
@@ -1368,9 +1354,6 @@ def main() -> None:
             )
 
             test_loss, test_acc = evaluate(model, test_loader, device=device)
-            final_epoch = epoch
-            last_epoch_test_loss = float(test_loss)
-            last_epoch_test_acc = float(test_acc)
             print(f"epoch={epoch} test_loss={test_loss:.4f} test_acc={test_acc:.4f}")
             logger.mark_event(
                 json.dumps(
@@ -1385,45 +1368,6 @@ def main() -> None:
         # Mark end of full training
         logger.mark_event("train_end")
         logger.disable()
-
-        save_model_checkpoint(
-            model,
-            model_save_path,
-            optimizer=optim,
-            epoch=final_epoch if final_epoch >= 0 else None,
-            global_step=global_step,
-            metrics={
-                "last_epoch_test_loss": float(last_epoch_test_loss) if last_epoch_test_loss is not None else float("nan"),
-                "last_epoch_test_acc": float(last_epoch_test_acc) if last_epoch_test_acc is not None else float("nan"),
-            },
-            run_info={
-                "run_name": run_name,
-                "dataset": args.dataset,
-                "config": args.config,
-                "poison_type": args.poison_type,
-                "poison_frac": float(args.poison_frac),
-                "img_size": int(img_size),
-                "normalize": args.normalize,
-                "epochs": int(args.epochs),
-                "batch_size": int(args.batch_size),
-                "lr": float(args.lr),
-                "optimizer": args.optimizer,
-                "seed": int(args.seed),
-                "device": str(device),
-                "model": args.model,
-                "dropout": float(args.dropout),
-                "train_split": train_split,
-                "test_split": test_split,
-                "log_csv": str(out_csv),
-                "grad_log_dir": str(grad_log_dir) if grad_log_dir is not None else None,
-            },
-        )
-        logger.mark_event(
-            json.dumps(
-                {"model_checkpoint": {"path": str(model_save_path), "epoch": final_epoch, "global_step": global_step}},
-                ensure_ascii=False,
-            )
-        )
 
         # Evaluation (logger disabled by default)
         test_loss, test_acc = evaluate(model, test_loader, device=device)

@@ -7,6 +7,8 @@ import json
 import sys
 from typing import Any
 
+import numpy as np
+
 
 ROOT_DIR = Path(__file__).resolve().parent
 DATA_ROOT = ROOT_DIR / "logs_120"
@@ -24,10 +26,10 @@ def _load_module(module_name: str, path: Path):
     return module
 
 
-def _heatmap_module():
+def _viz_module():
     if str(ROOT_DIR) not in sys.path:
         sys.path.insert(0, str(ROOT_DIR))
-    return _load_module("scenario_transport_heatmap_mod", ROOT_DIR / "6_transport_plan_heatmap.py")
+    return _load_module("scenario_cost_diag_viz_mod", ROOT_DIR / "9_cost_function_diagnostic_visualization.py")
 
 
 def _discover_cases(root: Path) -> dict[str, list[Path]]:
@@ -80,13 +82,8 @@ def _run_key(analysis, spec: str) -> tuple[str, str, str]:
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--root", default=str(DATA_ROOT))
-    p.add_argument("--out-dir", default=str(ROOT_DIR / "7_iterative_transport_heatmaps"))
-    p.add_argument(
-        "--min-runs",
-        type=int,
-        default=2,
-        help="minimum CSV count required for a case to be used as a base",
-    )
+    p.add_argument("--out-dir", default=str(ROOT_DIR / "10_iterative_cost_function_diagnostics"))
+    p.add_argument("--min-runs", type=int, default=2)
     p.add_argument(
         "--max-targets-per-case",
         type=int,
@@ -97,27 +94,34 @@ def main() -> None:
         "--mode",
         choices=["template", "target", "both"],
         default="both",
-        help="which comparison heatmaps to render",
+        help="which comparison diagnostics to render",
     )
+    p.add_argument("--value-mode", choices=["abs", "squared"], default="abs")
+    p.add_argument("--relation-bins", type=int, default=24)
+    p.add_argument("--scatter-max-points", type=int, default=12000)
+    p.add_argument("--reg-scale", type=float, default=0.05)
+    p.add_argument("--sharpness-eps", type=float, default=1e-9)
     p.add_argument(
-        "--max-side",
-        type=int,
-        default=96,
-        help="maximum image side after resampling the transport plan for display",
-    )
-    p.add_argument(
-        "--same-scenario-scale",
+        "--same-scenario-ratio-scale",
+        dest="same_scenario_ratio_scale",
         action="store_true",
-        help="reuse the same per-signal color scale across all plots within each base scenario",
+        help="use one fixed x-axis scale for the 5th-panel Ratio R_i histogram within each base scenario",
     )
+    p.add_argument(
+        "--no-same-scenario-ratio-scale",
+        dest="same_scenario_ratio_scale",
+        action="store_false",
+        help="disable the shared x-axis scale for the 5th-panel Ratio R_i histogram",
+    )
+    p.set_defaults(same_scenario_ratio_scale=True)
     args = p.parse_args()
 
     root = Path(args.root).resolve()
     out_dir = Path(args.out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    heatmap = _heatmap_module()
-    analysis = heatmap._analysis_module()
+    viz = _viz_module()
+    analysis = viz._analysis_module()
 
     cases = _discover_cases(root)
     base_cases = _eligible_cases(cases, min_runs=max(2, int(args.min_runs)))
@@ -141,47 +145,70 @@ def main() -> None:
             for csv_path in selected_csvs:
                 target_specs.append(_make_spec(case_name, f"target_{csv_path.stem}", csv_path))
 
-        specs = [ _make_spec(base_case, "template", template_csv) ]
+        specs = [_make_spec(base_case, "template", template_csv)]
         if args.mode in {"target", "both"}:
             specs.extend(target_specs)
 
         reference_spec = _make_spec(base_case, "reference", reference_csv)
         template_spec = _make_spec(base_case, "template", template_csv)
         df = analysis.load_logs(reference_spec, specs, device_id="scenario_device")
-        run_measures = heatmap._build_run_measures(df=df, analysis=analysis)
+        run_measures = viz._build_run_measures(df=df, analysis=analysis)
 
         ref_measures = run_measures[_run_key(analysis, reference_spec)]
         template_measures = run_measures[_run_key(analysis, template_spec)]
-        shared_scales = None
-        if args.same_scenario_scale:
-            scale_targets = [template_measures]
+
+        ratio_xmax = None
+        ratio_bin_edges = None
+        if args.same_scenario_ratio_scale:
+            ratio_xmax_value = 0.0
+            if args.mode in {"template", "both"}:
+                ratio_xmax_value = max(
+                    ratio_xmax_value,
+                    viz._ratio_xmax_for_pair(
+                        ref_measures=ref_measures,
+                        target_measures=template_measures,
+                        value_mode=args.value_mode,
+                        eps=float(args.sharpness_eps),
+                    ),
+                )
             if args.mode in {"target", "both"}:
                 for target_spec in target_specs:
                     target_group, _, target_path = analysis.parse_run_spec(target_spec)
                     target_csv = Path(target_path)
-                    scale_targets.append(run_measures[(target_group, f"target_{target_csv.stem}", str(target_csv))])
-            shared_scales = heatmap._compute_shared_scales(
-                ref_measures=ref_measures,
-                target_measures_list=scale_targets,
-                analysis=analysis,
-                max_side=int(args.max_side),
-            )
+                    target_measures = run_measures[(target_group, f"target_{target_csv.stem}", str(target_csv))]
+                    ratio_xmax_value = max(
+                        ratio_xmax_value,
+                        viz._ratio_xmax_for_pair(
+                            ref_measures=ref_measures,
+                            target_measures=target_measures,
+                            value_mode=args.value_mode,
+                            eps=float(args.sharpness_eps),
+                        ),
+                    )
+            if ratio_xmax_value > 0.0:
+                ratio_xmax = ratio_xmax_value
+                ratio_bin_edges = np.linspace(0.0, ratio_xmax_value, num=31, dtype=float)
 
         base_out_dir = out_dir / _slugify(base_case)
         base_out_dir.mkdir(parents=True, exist_ok=True)
 
         if args.mode in {"template", "both"}:
-            template_png = base_out_dir / "00_reference_vs_template_transport_heatmap.png"
-            stats = heatmap._plot_transport_heatmaps(
+            template_png = base_out_dir / "00_reference_vs_template_cost_diagnostic.png"
+            summary = viz._plot_diagnostics(
                 out_path=template_png,
-                pair_title=f"Transport Plan Heatmap: {base_case} Reference vs Template",
+                pair_title=f"Cost Function Diagnostic: {base_case} Reference vs Template",
                 ref_title=reference_csv.stem,
                 target_title=template_csv.stem,
                 ref_measures=ref_measures,
                 target_measures=template_measures,
                 analysis=analysis,
-                max_side=int(args.max_side),
-                shared_scales=shared_scales,
+                value_mode=args.value_mode,
+                relation_bins=int(args.relation_bins),
+                scatter_max_points=int(args.scatter_max_points),
+                reg_scale=float(args.reg_scale),
+                eps=float(args.sharpness_eps),
+                ratio_xmax=ratio_xmax,
+                ratio_bin_edges=ratio_bin_edges,
             )
             manifest_rows.append(
                 {
@@ -192,7 +219,8 @@ def main() -> None:
                     "target_csv": str(template_csv.resolve()),
                     "plot_png": str(template_png.resolve()),
                     "kind": "template",
-                    "stats": stats,
+                    "ratio_xmax": ratio_xmax,
+                    "summary": summary,
                 }
             )
 
@@ -201,17 +229,22 @@ def main() -> None:
                 target_group, _, target_path = analysis.parse_run_spec(target_spec)
                 target_csv = Path(target_path)
                 target_measures = run_measures[(target_group, f"target_{target_csv.stem}", str(target_csv))]
-                png_path = base_out_dir / f"{idx:02d}_{_slugify(target_group)}_{target_csv.stem}_transport_heatmap.png"
-                stats = heatmap._plot_transport_heatmaps(
+                png_path = base_out_dir / f"{idx:02d}_{_slugify(target_group)}_{target_csv.stem}_cost_diagnostic.png"
+                summary = viz._plot_diagnostics(
                     out_path=png_path,
-                    pair_title=f"Transport Plan Heatmap: {base_case} Reference vs {target_group}",
+                    pair_title=f"Cost Function Diagnostic: {base_case} Reference vs {target_group}",
                     ref_title=reference_csv.stem,
                     target_title=target_csv.stem,
                     ref_measures=ref_measures,
                     target_measures=target_measures,
                     analysis=analysis,
-                    max_side=int(args.max_side),
-                    shared_scales=shared_scales,
+                    value_mode=args.value_mode,
+                    relation_bins=int(args.relation_bins),
+                    scatter_max_points=int(args.scatter_max_points),
+                    reg_scale=float(args.reg_scale),
+                    eps=float(args.sharpness_eps),
+                    ratio_xmax=ratio_xmax,
+                    ratio_bin_edges=ratio_bin_edges,
                 )
                 manifest_rows.append(
                     {
@@ -222,11 +255,12 @@ def main() -> None:
                         "target_csv": str(target_csv.resolve()),
                         "plot_png": str(png_path.resolve()),
                         "kind": "target",
-                        "stats": stats,
+                        "ratio_xmax": ratio_xmax,
+                        "summary": summary,
                     }
                 )
 
-    manifest_path = out_dir / "iterative_transport_heatmap_manifest.json"
+    manifest_path = out_dir / "iterative_cost_function_diagnostic_manifest.json"
     manifest_path.write_text(json.dumps(manifest_rows, indent=2), encoding="utf-8")
     print(json.dumps({"manifest": str(manifest_path), "num_plots": len(manifest_rows)}, indent=2))
 

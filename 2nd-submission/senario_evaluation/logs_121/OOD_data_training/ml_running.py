@@ -1,6 +1,6 @@
 
 
-"""Train a simple CNN on TrashNet (HF) with optional poisoning variants.
+"""Train a simple CNN on TrashNet (HF) with optional prepared variants.
 
 Data
 - Clean data is loaded directly from Hugging Face dataset `kuchidareo/trashnet_small`.
@@ -11,10 +11,11 @@ Data
   Each has JPEGs + metadata.jsonl.
 
 Poisoning usage
-- Choose one of: none | clean | blurring | occlusion | label-flip
+- Choose one of: none | clean | blurring | occlusion | label-flip | ood
 - `none` loads clean HF training data directly.
 - Other variants load the prepared directory under <data_root>/<variant>/ directly.
-- `--poison-frac` is used only to validate prepared metadata when available.
+- `--poison-frac` validates corruption metadata when available.
+- `--ood-frac` validates OOD metadata for the OOD variant.
 
 Logging (important)
 - Writes ONE timestamped CSV: <log_dir>/<YYYYmmdd_HHMMSS>.csv
@@ -133,36 +134,6 @@ def normalize_tensor(x: torch.Tensor, mode: str) -> torch.Tensor:
     return (x - mean) / std
 
 
-def save_model_grads(model: nn.Module, save_path: Path | str) -> None:
-    grads: Dict[str, torch.Tensor] = {}
-    for name, p in model.named_parameters():
-        if p.grad is not None:
-            grads[name] = p.grad.detach().cpu().clone()
-    torch.save(grads, save_path)
-
-
-def save_model_checkpoint(
-    model: nn.Module,
-    save_path: Path | str,
-    *,
-    optimizer: Optional[torch.optim.Optimizer] = None,
-    epoch: Optional[int] = None,
-    global_step: Optional[int] = None,
-    metrics: Optional[Dict[str, float]] = None,
-    run_info: Optional[Dict[str, Any]] = None,
-) -> None:
-    checkpoint: Dict[str, Any] = {
-        "model_state_dict": model.state_dict(),
-        "epoch": None if epoch is None else int(epoch),
-        "global_step": None if global_step is None else int(global_step),
-        "metrics": dict(metrics) if metrics is not None else {},
-        "run_info": dict(run_info) if run_info is not None else {},
-    }
-    if optimizer is not None:
-        checkpoint["optimizer_state_dict"] = optimizer.state_dict()
-    torch.save(checkpoint, save_path)
-
-
 @dataclass(frozen=True)
 class TransformConfig:
     img_size: int
@@ -227,6 +198,7 @@ class PoisonDiskDataset(Dataset):
         split_name: str,
         tfm_cfg: TransformConfig,
         expected_poison_frac: Optional[float] = None,
+        expected_frac_field: str = "poison_frac",
     ) -> None:
         self.variant_dir = variant_dir
         self.split_name = split_name
@@ -247,7 +219,7 @@ class PoisonDiskDataset(Dataset):
                 fname = rec["file"]
                 if not fname.startswith(f"{split_name}_"):
                     continue
-                poison_frac = rec.get("poison_frac")
+                poison_frac = rec.get(expected_frac_field)
                 if poison_frac is not None:
                     try:
                         seen_poison_fracs.add(round(float(poison_frac), 6))
@@ -265,8 +237,8 @@ class PoisonDiskDataset(Dataset):
             expected = round(float(expected_poison_frac), 6)
             if expected not in seen_poison_fracs:
                 warnings.warn(
-                    f"Prepared metadata poison_frac={sorted(seen_poison_fracs)} does not match "
-                    f"requested --poison-frac={expected_poison_frac} for {meta_path}",
+                    f"Prepared metadata {expected_frac_field}={sorted(seen_poison_fracs)} does not match "
+                    f"requested expected value={expected_poison_frac} for {meta_path}",
                     stacklevel=2,
                 )
 
@@ -301,7 +273,7 @@ def subsample_dataset(ds: Dataset, frac: float, seed: int) -> Dataset:
 
 
 class SimpleCNN(nn.Module):
-    def __init__(self, n_classes: int, img_size: int, dropout: float = 0.0) -> None:
+    def __init__(self, n_classes: int, img_size: int) -> None:
         super().__init__()
 
         # 3 conv layers
@@ -319,9 +291,7 @@ class SimpleCNN(nn.Module):
 
         # 3 fc layers
         self.fc1 = nn.Linear(feat_dim, 256)
-        self.dropout1 = nn.Dropout(float(dropout))
         self.fc2 = nn.Linear(256, 128)
-        self.dropout2 = nn.Dropout(float(dropout))
         self.fc3 = nn.Linear(128, n_classes)
 
     def _forward_features(self, x: torch.Tensor) -> torch.Tensor:
@@ -334,9 +304,7 @@ class SimpleCNN(nn.Module):
         x = self._forward_features(x)
         x = torch.flatten(x, 1)
         x = F.relu(self.fc1(x))
-        x = self.dropout1(x)
         x = F.relu(self.fc2(x))
-        x = self.dropout2(x)
         x = self.fc3(x)
         return x
 
@@ -862,8 +830,6 @@ def train_one_epoch(
     logger: CSVRunLogger,
     epoch: int,
     global_step_start: int,
-    save_grad: bool = False,
-    grad_log_dir: Optional[Path] = None,
     bg_cfg: Optional[Dict[str, Any]] = None,
     seed: int = 0,
 ) -> int:
@@ -930,9 +896,6 @@ def train_one_epoch(
         logits = model(x)
         loss = criterion(logits, y)
         loss.backward()
-        if save_grad and grad_log_dir is not None:
-            grad_path = grad_log_dir / f"epoch_{epoch:04d}_step_{global_step:06d}.pt"
-            save_model_grads(model, grad_path)
         optim.step()
 
         with torch.no_grad():
@@ -1035,9 +998,10 @@ def parse_args() -> argparse.Namespace:
         "--poison-type",
         type=str,
         default="none",
-        choices=["none", "clean", "augmentation", "ood", "blurring", "occlusion", "steganography", "label-flip"],
+        choices=["none", "clean", "blurring", "occlusion", "label-flip", "ood"],
     )
     p.add_argument("--poison-frac", type=float, default=1.0, help="Fraction of poison samples to add (0..1)")
+    p.add_argument("--ood-frac", type=float, default=0.3, help="Expected OOD fraction in prepared metadata")
     p.add_argument(
         "--background-script",
         type=str,
@@ -1080,7 +1044,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--epochs", type=int, default=5)
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--optimizer", type=str, default="adam", choices=["adam", "adamw"])
     p.add_argument("--num-workers", type=int, default=2)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -1094,44 +1057,10 @@ def parse_args() -> argparse.Namespace:
         default="simple_cnn",
         choices=["simple_cnn", "mobilenet_v3_large"],
     )
-    p.add_argument(
-        "--dropout",
-        type=float,
-        default=0.0,
-        help="Dropout probability after simple_cnn fc1/fc2; 0 disables dropout",
-    )
 
     # Logging
     p.add_argument("--log-dir", type=str, default="logs")
-    p.add_argument(
-        "--model-save-root",
-        type=str,
-        default="model_checkpoints",
-        help="Root directory for saving the final trained model checkpoint.",
-    )
     p.add_argument("--log-fps", type=float, default=1.0)
-    p.add_argument(
-        "--grad-log-root",
-        type=str,
-        default="grad_logs",
-        help="Root directory for saved gradient .pt files.",
-    )
-    p.add_argument(
-        "--grad-reference-run",
-        action="store_true",
-        help="Save all epoch/step gradients and keep them.",
-    )
-    p.add_argument(
-        "--grad-analysis-ref",
-        type=str,
-        default=None,
-        help=argparse.SUPPRESS,
-    )
-    p.add_argument("--grad-analysis-csv", type=str, default=None, help=argparse.SUPPRESS)
-    p.add_argument("--grad-analysis-log-dir", type=str, default=None, help=argparse.SUPPRESS)
-    p.add_argument("--grad-analysis-eps", type=float, default=0.0, help=argparse.SUPPRESS)
-    p.add_argument("--grad-analysis-layers", type=str, nargs="*", default=None, help=argparse.SUPPRESS)
-    p.add_argument("--keep-grad-after-analysis", action="store_true", help=argparse.SUPPRESS)
     p.add_argument(
         "--disable-perf",
         action="store_true",
@@ -1196,11 +1125,14 @@ def main() -> None:
         train_ds = clean_train
     else:
         variant_dir = Path(args.data_root) / args.poison_type
+        expected_frac = float(args.ood_frac) if args.poison_type == "ood" else float(args.poison_frac)
+        expected_frac_field = "ood_frac" if args.poison_type == "ood" else "poison_frac"
         prepared_train = PoisonDiskDataset(
             variant_dir=variant_dir,
             split_name=train_split,
             tfm_cfg=tfm_cfg,
-            expected_poison_frac=float(args.poison_frac),
+            expected_poison_frac=expected_frac,
+            expected_frac_field=expected_frac_field,
         )
         train_ds = subsample_dataset(prepared_train, frac=float(args.train_frac), seed=args.seed + 2)
 
@@ -1224,27 +1156,13 @@ def main() -> None:
     if args.model == "mobilenet_v3_large":
         model = MobileNetV3Large(num_classes=n_classes).to(device)
     else:
-        model = SimpleCNN(n_classes=n_classes, img_size=int(img_size), dropout=float(args.dropout)).to(device)
-    if args.optimizer == "adamw":
-        optim = torch.optim.AdamW(model.parameters(), lr=float(args.lr))
-    else:
-        optim = torch.optim.Adam(model.parameters(), lr=float(args.lr))
+        model = SimpleCNN(n_classes=n_classes, img_size=int(img_size)).to(device)
+    optim = torch.optim.Adam(model.parameters(), lr=float(args.lr))
 
     # Logger
     log_dir = Path(args.log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
-    model_save_root = Path(args.model_save_root)
-    model_save_root.mkdir(parents=True, exist_ok=True)
-    run_name = _timestamp_name()
-    out_csv = log_dir / f"{run_name}.csv"
-    model_save_path = model_save_root / f"{run_name}_final.pt"
-    grad_log_dir: Optional[Path] = None
-    save_gradients = bool(args.grad_reference_run) or bool(args.grad_analysis_ref)
-    if args.grad_analysis_ref:
-        print("warning: --grad-analysis-ref is deprecated and no analysis will run; saving gradients only.")
-    if save_gradients:
-        grad_log_dir = Path(args.grad_log_root) / run_name
-        grad_log_dir.mkdir(parents=True, exist_ok=True)
+    out_csv = log_dir / f"{_timestamp_name()}.csv"
 
     proc = psutil.Process(os.getpid())
     collectors: List[MetricsCollector] = [SystemCollector(proc)]
@@ -1274,12 +1192,12 @@ def main() -> None:
                     "test_split": test_split,
                     "poison_type": args.poison_type,
                     "poison_frac": float(args.poison_frac),
+                    "ood_frac": float(args.ood_frac),
                     "img_size": int(img_size),
                     "normalize": args.normalize,
                     "epochs": int(args.epochs),
                     "batch_size": int(args.batch_size),
                     "lr": float(args.lr),
-                    "optimizer": args.optimizer,
                     "seed": int(args.seed),
                     "train_frac": float(args.train_frac),
                     "test_frac": float(args.test_frac),
@@ -1288,12 +1206,6 @@ def main() -> None:
                     "python": platform.python_version(),
                     "torch": torch.__version__,
                     "model": args.model,
-                    "dropout": float(args.dropout),
-                    "grad_reference_run": bool(args.grad_reference_run),
-                    "grad_log_root": str(args.grad_log_root),
-                    "grad_log_dir": str(grad_log_dir) if grad_log_dir is not None else None,
-                    "grad_analysis_disabled": True,
-                    "grad_analysis_ref_ignored": str(args.grad_analysis_ref) if args.grad_analysis_ref else None,
                     "disable_perf": bool(args.disable_perf),
                     "background_script": args.background_script,
                     "background_bursts_per_epoch": int(args.background_bursts_per_epoch),
@@ -1308,18 +1220,13 @@ def main() -> None:
     )
 
     print("=== Run ===")
-    print(f"dataset={args.dataset} split=({train_split},{test_split}) poison={args.poison_type} frac={args.poison_frac}")
+    selected_frac = float(args.ood_frac) if args.poison_type == "ood" else float(args.poison_frac)
+    print(f"dataset={args.dataset} split=({train_split},{test_split}) poison={args.poison_type} frac={selected_frac}")
     print(f"img_size={img_size} normalize={args.normalize} n_classes={n_classes} device={device}")
     print(f"log_csv={out_csv}")
-    if grad_log_dir is not None:
-        print(f"grad_log_dir={grad_log_dir}")
-    print(f"model_checkpoint={model_save_path}")
 
     # Training
     global_step = 0
-    final_epoch = -1
-    last_epoch_test_loss: Optional[float] = None
-    last_epoch_test_acc: Optional[float] = None
     logger.enable()
     logger.mark_event("train_start")
 
@@ -1361,22 +1268,8 @@ def main() -> None:
                 logger=logger,
                 epoch=epoch,
                 global_step_start=global_step,
-                save_grad=save_gradients,
-                grad_log_dir=grad_log_dir,
                 bg_cfg=bg_cfg,
                 seed=int(args.seed),
-            )
-
-            test_loss, test_acc = evaluate(model, test_loader, device=device)
-            final_epoch = epoch
-            last_epoch_test_loss = float(test_loss)
-            last_epoch_test_acc = float(test_acc)
-            print(f"epoch={epoch} test_loss={test_loss:.4f} test_acc={test_acc:.4f}")
-            logger.mark_event(
-                json.dumps(
-                    {"epoch_eval": {"epoch": epoch, "loss": test_loss, "acc": test_acc}},
-                    ensure_ascii=False,
-                )
             )
 
             # Mark end of each epoch
@@ -1385,45 +1278,6 @@ def main() -> None:
         # Mark end of full training
         logger.mark_event("train_end")
         logger.disable()
-
-        save_model_checkpoint(
-            model,
-            model_save_path,
-            optimizer=optim,
-            epoch=final_epoch if final_epoch >= 0 else None,
-            global_step=global_step,
-            metrics={
-                "last_epoch_test_loss": float(last_epoch_test_loss) if last_epoch_test_loss is not None else float("nan"),
-                "last_epoch_test_acc": float(last_epoch_test_acc) if last_epoch_test_acc is not None else float("nan"),
-            },
-            run_info={
-                "run_name": run_name,
-                "dataset": args.dataset,
-                "config": args.config,
-                "poison_type": args.poison_type,
-                "poison_frac": float(args.poison_frac),
-                "img_size": int(img_size),
-                "normalize": args.normalize,
-                "epochs": int(args.epochs),
-                "batch_size": int(args.batch_size),
-                "lr": float(args.lr),
-                "optimizer": args.optimizer,
-                "seed": int(args.seed),
-                "device": str(device),
-                "model": args.model,
-                "dropout": float(args.dropout),
-                "train_split": train_split,
-                "test_split": test_split,
-                "log_csv": str(out_csv),
-                "grad_log_dir": str(grad_log_dir) if grad_log_dir is not None else None,
-            },
-        )
-        logger.mark_event(
-            json.dumps(
-                {"model_checkpoint": {"path": str(model_save_path), "epoch": final_epoch, "global_step": global_step}},
-                ensure_ascii=False,
-            )
-        )
 
         # Evaluation (logger disabled by default)
         test_loss, test_acc = evaluate(model, test_loader, device=device)

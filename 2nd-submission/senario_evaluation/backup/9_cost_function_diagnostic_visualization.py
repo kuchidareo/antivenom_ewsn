@@ -28,7 +28,7 @@ def _load_module(module_name: str, path: Path):
 def _analysis_module():
     if str(ROOT_DIR) not in sys.path:
         sys.path.insert(0, str(ROOT_DIR))
-    return _load_module("scenario_unbinned_ot_cost_diag_mod", ROOT_DIR / "11_unbinned_ot_analysis.py")
+    return _load_module("scenario_unbinned_ot_cost_diag_mod", ROOT_DIR / "011_unbinned_ot_analysis.py")
 
 
 def _default_csvs(root: Path) -> tuple[Path, Path, Path]:
@@ -158,6 +158,23 @@ def _best_candidate_sharpness(
     return delta, ratio
 
 
+def _ratio_xmax_for_pair(
+    ref_measures: dict[str, dict[str, np.ndarray]],
+    target_measures: dict[str, dict[str, np.ndarray]],
+    value_mode: str,
+    eps: float,
+) -> float:
+    squared = value_mode == "squared"
+    max_ratio = 0.0
+    for signal_name, _signal_label in SIGNAL_ORDER:
+        value_diff = _value_diff_matrix(ref_measures[signal_name], target_measures[signal_name], squared=squared)
+        _delta, ratio = _best_candidate_sharpness(value_diff, eps=eps)
+        valid_ratio = ratio[np.isfinite(ratio) & (ratio > 0.0)]
+        if valid_ratio.size:
+            max_ratio = max(max_ratio, float(np.nanmax(valid_ratio)))
+    return max_ratio
+
+
 def _plot_diagnostics(
     out_path: Path,
     pair_title: str,
@@ -171,6 +188,8 @@ def _plot_diagnostics(
     scatter_max_points: int,
     reg_scale: float,
     eps: float,
+    ratio_xmax: float | None = None,
+    ratio_bin_edges: np.ndarray | None = None,
 ) -> dict[str, dict[str, float]]:
     squared = value_mode == "squared"
     fig, axes = plt.subplots(nrows=len(SIGNAL_ORDER), ncols=5, figsize=(25, 4.0 * len(SIGNAL_ORDER)), constrained_layout=True)
@@ -194,6 +213,7 @@ def _plot_diagnostics(
 
         valid_delta = delta[np.isfinite(delta)]
         valid_ratio = ratio[np.isfinite(ratio)]
+        valid_ratio_nonzero = valid_ratio[valid_ratio > 0.0]
         valid_curve = val_means[np.isfinite(val_means)]
         slope = float("nan")
         if np.count_nonzero(np.isfinite(val_means)) >= 2:
@@ -272,15 +292,20 @@ def _plot_diagnostics(
             bbox={"facecolor": "white", "alpha": 0.82, "edgecolor": "none"},
         )
 
-        ax_ratio.hist(valid_ratio, bins=30, color="#f4a261", alpha=0.85)
+        hist_bins: int | np.ndarray = 30
+        if ratio_bin_edges is not None and len(ratio_bin_edges) >= 2:
+            hist_bins = ratio_bin_edges
+        ax_ratio.hist(valid_ratio_nonzero, bins=hist_bins, color="#f4a261", alpha=0.85)
         ax_ratio.set_title(f"{signal_label}\nRatio R_i")
         ax_ratio.set_xlabel("d_(2) / (d_(1) + eps)")
         ax_ratio.set_ylabel("Count")
+        if ratio_xmax is not None and np.isfinite(ratio_xmax) and ratio_xmax > 0.0:
+            ax_ratio.set_xlim(0.0, float(ratio_xmax))
         ax_ratio.grid(alpha=0.25)
         ax_ratio.text(
             0.02,
             0.98,
-            f"median={summary[signal_name]['ratio_median']:.4f}\neps={eps:g}",
+            f"median={summary[signal_name]['ratio_median']:.4f}\nshown: R_i>0\neps={eps:g}",
             transform=ax_ratio.transAxes,
             ha="left",
             va="top",
@@ -290,7 +315,7 @@ def _plot_diagnostics(
 
     fig.suptitle(
         f"{pair_title}\nReference: {ref_title}    Target: {target_title}\n"
-        f"Relative time from 11_ epoch measure, value_mode={value_mode}, reg_scale={reg_scale}",
+        f"Relative time from 011_ epoch measure, value_mode={value_mode}, reg_scale={reg_scale}",
         fontsize=15,
     )
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -324,6 +349,12 @@ def main() -> None:
     p.add_argument("--scatter-max-points", type=int, default=12000)
     p.add_argument("--reg-scale", type=float, default=0.05)
     p.add_argument("--sharpness-eps", type=float, default=1e-9)
+    p.add_argument(
+        "--ratio-xmax",
+        type=float,
+        default=0.0,
+        help="optional fixed x-axis max for the 5th-panel Ratio R_i histogram; 0 means autoscale",
+    )
     args = p.parse_args()
 
     root = Path(args.root).resolve()
@@ -369,6 +400,7 @@ def main() -> None:
             scatter_max_points=int(args.scatter_max_points),
             reg_scale=float(args.reg_scale),
             eps=float(args.sharpness_eps),
+            ratio_xmax=float(args.ratio_xmax) if float(args.ratio_xmax) > 0.0 else None,
         )
         outputs.append(
             {
@@ -395,6 +427,7 @@ def main() -> None:
             scatter_max_points=int(args.scatter_max_points),
             reg_scale=float(args.reg_scale),
             eps=float(args.sharpness_eps),
+            ratio_xmax=float(args.ratio_xmax) if float(args.ratio_xmax) > 0.0 else None,
         )
         outputs.append(
             {
@@ -416,6 +449,7 @@ def main() -> None:
         "scatter_max_points": int(args.scatter_max_points),
         "reg_scale": float(args.reg_scale),
         "sharpness_eps": float(args.sharpness_eps),
+        "ratio_xmax": float(args.ratio_xmax),
         "outputs": outputs,
     }
     manifest_path = out_dir / "manifest.json"

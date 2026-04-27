@@ -12,15 +12,8 @@ import pandas as pd
 
 
 ROOT_DIR = Path(__file__).resolve().parent
-FOCUSED_SCENARIOS = {
-    "baseclean",
-    "baseblurring",
-    "OOD_data_training",
-    "data_augmentation",
-    "backward_stabilization",
-}
 EXCLUDED_RUNS = {
-    ("adamw_weight_decay/clean", "20260411_171943"),
+#     ("adamw_weight_decay/clean", "20260411_171943"),
 }
 
 
@@ -36,7 +29,7 @@ def _load_module(module_name: str, path: Path):
 def _analysis_module():
     if str(ROOT_DIR) not in sys.path:
         sys.path.insert(0, str(ROOT_DIR))
-    return _load_module("scenario_analysis_mod", ROOT_DIR / "01_cpu_core_sorted_mem_baseclean_analysis.py")
+    return _load_module("scenario_analysis_mod", ROOT_DIR / "011_unbinned_ot_analysis.py")
 
 
 def _plot_module():
@@ -52,8 +45,6 @@ def _discover_cases(root: Path) -> dict[str, list[Path]]:
 
     for scenario_dir in sorted(p for p in root.iterdir() if p.is_dir()):
         if scenario_dir.name == "__pycache__":
-            continue
-        if scenario_dir.name not in FOCUSED_SCENARIOS:
             continue
 
         direct_csvs = sorted(scenario_dir.glob("*.csv"))
@@ -195,7 +186,6 @@ def _plot_case_summary(
 def _build_case_summary(
     base_case: str,
     cases: dict[str, list[Path]],
-    bins: int,
 ) -> pd.DataFrame:
     analysis = _analysis_module()
     eligible_cases = _ordered_case_names(cases, min_runs=2)
@@ -234,7 +224,6 @@ def _build_case_summary(
         template_group=template_group,
         template_label=template_label,
         target_keys=target_keys,
-        bins=bins,
     )
     summary["base_case"] = base_case
     return summary
@@ -243,8 +232,7 @@ def _build_case_summary(
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--root", default=str(ROOT_DIR / "logs_120"))
-    p.add_argument("--out-dir", default=str(ROOT_DIR / "iterative_analysis_31"))
-    p.add_argument("--bins", type=int, default=50)
+    p.add_argument("--out-dir", default=str(ROOT_DIR / "iterative_analysis"))
     p.add_argument(
         "--min-runs",
         type=int,
@@ -253,7 +241,7 @@ def main() -> None:
     )
     p.add_argument(
         "--title",
-        default="Focused Iterative Scenario Comparison",
+        default="Iterative Scenario Comparison",
     )
     args = p.parse_args()
 
@@ -270,7 +258,7 @@ def main() -> None:
 
     for base_case in base_cases:
         base_csvs = [csv_path for csv_path in cases[base_case] if not _is_excluded_run(base_case, csv_path)]
-        summary = _build_case_summary(base_case=base_case, cases=cases, bins=args.bins)
+        summary = _build_case_summary(base_case=base_case, cases=cases)
         csv_path = out_dir / f"{_slugify(base_case)}_compare.csv"
         summary.to_csv(csv_path, index=False)
         png_path = out_dir / f"{_slugify(base_case)}_box.png"

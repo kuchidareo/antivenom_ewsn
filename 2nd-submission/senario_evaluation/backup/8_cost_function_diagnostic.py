@@ -28,7 +28,7 @@ def _load_module(module_name: str, path: Path):
 def _analysis_module():
     if str(ROOT_DIR) not in sys.path:
         sys.path.insert(0, str(ROOT_DIR))
-    return _load_module("scenario_unbinned_ot_diagnostic_mod", ROOT_DIR / "11_unbinned_ot_analysis.py")
+    return _load_module("scenario_unbinned_ot_diagnostic_mod", ROOT_DIR / "011_unbinned_ot_analysis.py")
 
 
 def _default_csvs(root: Path) -> tuple[Path, Path, Path]:
@@ -290,7 +290,7 @@ def _plot_diagnostics(
 
     fig.suptitle(
         f"{pair_title}\nReference: {ref_title}    Target: {target_title}\n"
-        f"Relative time from 11_ epoch measure, value_mode={value_mode}, reg_scale={reg_scale}",
+        f"Relative time from 011_ epoch measure, value_mode={value_mode}, reg_scale={reg_scale}",
         fontsize=15,
     )
     out_path.parent.mkdir(parents=True, exist_ok=True)

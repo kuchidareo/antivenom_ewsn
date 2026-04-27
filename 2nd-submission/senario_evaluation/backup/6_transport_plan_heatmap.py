@@ -28,7 +28,7 @@ def _load_module(module_name: str, path: Path):
 def _analysis_module():
     if str(ROOT_DIR) not in sys.path:
         sys.path.insert(0, str(ROOT_DIR))
-    return _load_module("scenario_unbinned_ot_mod", ROOT_DIR / "11_unbinned_ot_analysis.py")
+    return _load_module("scenario_unbinned_ot_mod", ROOT_DIR / "011_unbinned_ot_analysis.py")
 
 
 def _default_csvs(root: Path) -> tuple[Path, Path, Path]:
@@ -83,6 +83,8 @@ def _compute_shared_scales(
     target_measures_list: list[dict[str, dict[str, np.ndarray]]],
     analysis,
     max_side: int,
+    cost_function: str = "time_distance_shape",
+    z_normalize_window: bool = False,
 ) -> dict[str, dict[str, float]]:
     shared_scales: dict[str, dict[str, float]] = {}
 
@@ -93,7 +95,12 @@ def _compute_shared_scales(
 
         for target_measures in target_measures_list:
             target_measure = target_measures[signal_name]
-            plan, cost, _ot_distance = analysis._transport_plan(ref_measure, target_measure)
+            plan, cost, _ot_distance = analysis._transport_plan(
+                ref_measure,
+                target_measure,
+                cost_function=str(cost_function),
+                z_normalize_window=bool(z_normalize_window),
+            )
             plan_img = _plan_image(plan, analysis=analysis, max_side=max_side)
             cost_img = _plan_image(cost * plan if cost.size else cost, analysis=analysis, max_side=max_side)
             if plan_img.size:
@@ -119,6 +126,8 @@ def _plot_transport_heatmaps(
     analysis,
     max_side: int,
     shared_scales: dict[str, dict[str, float]] | None = None,
+    cost_function: str = "time_distance_shape",
+    z_normalize_window: bool = False,
 ) -> dict[str, float]:
     nrows = len(SIGNAL_ORDER)
     fig, axes = plt.subplots(nrows=nrows, ncols=2, figsize=(14, 3.2 * nrows), constrained_layout=True)
@@ -128,11 +137,21 @@ def _plot_transport_heatmaps(
 
     stats: dict[str, float] = {}
     plot_items: list[dict[str, object]] = []
+    core_time_terms: list[float] = []
+    core_value_terms: list[float] = []
+    core_shape_terms: list[float] = []
+    core_ot_terms: list[float] = []
 
     for signal_name, signal_label in SIGNAL_ORDER:
         ref_measure = ref_measures[signal_name]
         target_measure = target_measures[signal_name]
-        plan, cost, ot_distance = analysis._transport_plan(ref_measure, target_measure)
+        plan, cost, ot_distance, detail = analysis._transport_plan(
+            ref_measure,
+            target_measure,
+            cost_function=str(cost_function),
+            z_normalize_window=bool(z_normalize_window),
+            return_details=True,
+        )
         plan_img = _plan_image(plan, analysis=analysis, max_side=max_side)
         cost_img = _plan_image(cost * plan if cost.size else cost, analysis=analysis, max_side=max_side)
         plot_items.append(
@@ -140,6 +159,10 @@ def _plot_transport_heatmaps(
                 "signal_name": signal_name,
                 "signal_label": signal_label,
                 "ot_distance": ot_distance,
+                "cost_total": float(np.sum(plan * cost)) if plan.size else float("nan"),
+                "time_contribution": float(detail["time_cost_mean"]),
+                "value_contribution": float(detail["value_cost_mean"]),
+                "shape_contribution": float(detail["shape_cost_mean"]),
                 "plan_img": plan_img,
                 "cost_img": cost_img,
                 "ref_points": len(ref_measure["t"]),
@@ -147,6 +170,24 @@ def _plot_transport_heatmaps(
             }
         )
         stats[f"{signal_name}_ot_distance"] = float(ot_distance)
+        stats[f"{signal_name}_time_contribution"] = float(detail["time_cost_mean"])
+        stats[f"{signal_name}_value_contribution"] = float(detail["value_cost_mean"])
+        stats[f"{signal_name}_shape_contribution"] = float(detail["shape_cost_mean"])
+        stats[f"{signal_name}_ref_points"] = float(len(ref_measure["t"]))
+        stats[f"{signal_name}_target_points"] = float(len(target_measure["t"]))
+        if signal_name.startswith("core_"):
+            core_ot_terms.append(float(ot_distance))
+            core_time_terms.append(float(detail["time_cost_mean"]))
+            core_value_terms.append(float(detail["value_cost_mean"]))
+            core_shape_terms.append(float(detail["shape_cost_mean"]))
+
+    if core_ot_terms:
+        stats["core_ot_distance_mean"] = float(np.mean(core_ot_terms))
+        stats["core_time_contribution_mean"] = float(np.mean(core_time_terms))
+        stats["core_value_contribution_mean"] = float(np.mean(core_value_terms))
+        stats["core_shape_contribution_mean"] = float(np.mean(core_shape_terms))
+    stats["cost_function"] = str(cost_function)
+    stats["z_normalize_window"] = float(bool(z_normalize_window))
 
     for row_idx, item in enumerate(plot_items):
         ax_plan = axes[row_idx, 0]
@@ -154,7 +195,10 @@ def _plot_transport_heatmaps(
         plan_img = np.asarray(item["plan_img"], dtype=float)
         cost_img = np.asarray(item["cost_img"], dtype=float)
         ot_distance = float(item["ot_distance"])
-        cost_total = float(np.nansum(cost_img))
+        cost_total = float(item["cost_total"])
+        time_contribution = float(item["time_contribution"])
+        value_contribution = float(item["value_contribution"])
+        shape_contribution = float(item["shape_contribution"])
         signal_label = str(item["signal_label"])
         ref_points = int(item["ref_points"])
         target_points = int(item["target_points"])
@@ -190,6 +234,16 @@ def _plot_transport_heatmaps(
         ax_cost.set_ylabel("Ref points")
         cbar_cost = fig.colorbar(im_cost, ax=ax_cost, fraction=0.046, pad=0.02)
         cbar_cost.ax.set_ylabel("Contribution", rotation=90)
+        ax_cost.text(
+            0.01,
+            0.98,
+            f"time={time_contribution:.4f}\nvalue={value_contribution:.4f}\nshape={shape_contribution:.4f}",
+            transform=ax_cost.transAxes,
+            ha="left",
+            va="top",
+            fontsize=9,
+            bbox={"facecolor": "white", "alpha": 0.8, "edgecolor": "none"},
+        )
 
     fig.suptitle(f"{pair_title}\nReference: {ref_title}    Target: {target_title}", fontsize=15)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -223,6 +277,17 @@ def main() -> None:
         "--same-scenario-scale",
         action="store_true",
         help="reuse the same per-signal color scale across all comparisons in this run",
+    )
+    p.add_argument(
+        "--z-normalize-window",
+        action="store_true",
+        help="z-normalize each local window before shape comparison in the OT cost",
+    )
+    p.add_argument(
+        "--cost-function",
+        choices=["time_distance", "time_distance_shape", "time_distance_delta"],
+        default="time_distance_shape",
+        help="select the OT cost used to compute the transport plan",
     )
     args = p.parse_args()
 
@@ -262,6 +327,8 @@ def main() -> None:
             target_measures_list=scale_targets,
             analysis=analysis,
             max_side=int(args.max_side),
+            cost_function=str(args.cost_function),
+            z_normalize_window=bool(args.z_normalize_window),
         )
 
     outputs: list[dict[str, object]] = []
@@ -277,6 +344,8 @@ def main() -> None:
             analysis=analysis,
             max_side=int(args.max_side),
             shared_scales=shared_scales,
+            cost_function=str(args.cost_function),
+            z_normalize_window=bool(args.z_normalize_window),
         )
         outputs.append(
             {
@@ -300,6 +369,8 @@ def main() -> None:
             analysis=analysis,
             max_side=int(args.max_side),
             shared_scales=shared_scales,
+            cost_function=str(args.cost_function),
+            z_normalize_window=bool(args.z_normalize_window),
         )
         outputs.append(
             {
@@ -317,6 +388,8 @@ def main() -> None:
         "target_csv": str(target_csv),
         "mode": args.mode,
         "max_side": int(args.max_side),
+        "cost_function": str(args.cost_function),
+        "z_normalize_window": bool(args.z_normalize_window),
         "outputs": outputs,
     }
     manifest_path = out_dir / "manifest.json"

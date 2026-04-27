@@ -133,36 +133,6 @@ def normalize_tensor(x: torch.Tensor, mode: str) -> torch.Tensor:
     return (x - mean) / std
 
 
-def save_model_grads(model: nn.Module, save_path: Path | str) -> None:
-    grads: Dict[str, torch.Tensor] = {}
-    for name, p in model.named_parameters():
-        if p.grad is not None:
-            grads[name] = p.grad.detach().cpu().clone()
-    torch.save(grads, save_path)
-
-
-def save_model_checkpoint(
-    model: nn.Module,
-    save_path: Path | str,
-    *,
-    optimizer: Optional[torch.optim.Optimizer] = None,
-    epoch: Optional[int] = None,
-    global_step: Optional[int] = None,
-    metrics: Optional[Dict[str, float]] = None,
-    run_info: Optional[Dict[str, Any]] = None,
-) -> None:
-    checkpoint: Dict[str, Any] = {
-        "model_state_dict": model.state_dict(),
-        "epoch": None if epoch is None else int(epoch),
-        "global_step": None if global_step is None else int(global_step),
-        "metrics": dict(metrics) if metrics is not None else {},
-        "run_info": dict(run_info) if run_info is not None else {},
-    }
-    if optimizer is not None:
-        checkpoint["optimizer_state_dict"] = optimizer.state_dict()
-    torch.save(checkpoint, save_path)
-
-
 @dataclass(frozen=True)
 class TransformConfig:
     img_size: int
@@ -301,7 +271,7 @@ def subsample_dataset(ds: Dataset, frac: float, seed: int) -> Dataset:
 
 
 class SimpleCNN(nn.Module):
-    def __init__(self, n_classes: int, img_size: int, dropout: float = 0.0) -> None:
+    def __init__(self, n_classes: int, img_size: int) -> None:
         super().__init__()
 
         # 3 conv layers
@@ -319,9 +289,7 @@ class SimpleCNN(nn.Module):
 
         # 3 fc layers
         self.fc1 = nn.Linear(feat_dim, 256)
-        self.dropout1 = nn.Dropout(float(dropout))
         self.fc2 = nn.Linear(256, 128)
-        self.dropout2 = nn.Dropout(float(dropout))
         self.fc3 = nn.Linear(128, n_classes)
 
     def _forward_features(self, x: torch.Tensor) -> torch.Tensor:
@@ -334,9 +302,7 @@ class SimpleCNN(nn.Module):
         x = self._forward_features(x)
         x = torch.flatten(x, 1)
         x = F.relu(self.fc1(x))
-        x = self.dropout1(x)
         x = F.relu(self.fc2(x))
-        x = self.dropout2(x)
         x = self.fc3(x)
         return x
 
@@ -352,6 +318,112 @@ class MobileNetV3Large(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.model(x)
+
+
+# =============================
+# Model pruning: gradual magnitude pruning
+# =============================
+
+
+class GMPPruner:
+    """Global magnitude pruning for unstructured sparsity."""
+
+    def __init__(
+        self,
+        model: nn.Module,
+        target_types: Tuple[type, ...] = (nn.Linear, nn.Conv2d),
+    ) -> None:
+        self.model = model
+        self.params: List[Tuple[str, nn.Parameter]] = []
+        self.masks: Dict[str, torch.Tensor] = {}
+
+        for name, module in model.named_modules():
+            if isinstance(module, target_types) and getattr(module, "weight", None) is not None:
+                full_name = f"{name}.weight" if name else "weight"
+                self.params.append((full_name, module.weight))
+                self.masks[full_name] = torch.ones_like(module.weight.data)
+
+    @torch.no_grad()
+    def apply_masks(self) -> None:
+        for name, param in self.params:
+            param.mul_(self.masks[name])
+
+    @torch.no_grad()
+    def mask_gradients(self) -> None:
+        for name, param in self.params:
+            if param.grad is not None:
+                param.grad.mul_(self.masks[name])
+
+    @torch.no_grad()
+    def update_masks(self, target_sparsity: float) -> None:
+        target_sparsity = float(min(max(target_sparsity, 0.0), 1.0))
+
+        alive_abs_weights: List[torch.Tensor] = []
+        total_params = 0
+        for name, param in self.params:
+            mask = self.masks[name]
+            total_params += int(mask.numel())
+            alive = param.data[mask.bool()].abs()
+            if alive.numel() > 0:
+                alive_abs_weights.append(alive)
+
+        if not alive_abs_weights or total_params <= 0:
+            return
+
+        all_alive = torch.cat([x.flatten() for x in alive_abs_weights])
+        total_alive = int(all_alive.numel())
+
+        n_prune_total = int(target_sparsity * total_params)
+        n_alive_should_remain = total_params - n_prune_total
+        n_alive_should_remain = max(0, min(n_alive_should_remain, total_alive))
+
+        if n_alive_should_remain == total_alive:
+            return
+
+        if n_alive_should_remain == 0:
+            for name in self.masks:
+                self.masks[name].zero_()
+            self.apply_masks()
+            return
+
+        kth = total_alive - n_alive_should_remain + 1
+        threshold = torch.kthvalue(all_alive, kth).values.item()
+
+        for name, param in self.params:
+            old_mask = self.masks[name]
+            new_mask = ((param.data.abs() > threshold) & (old_mask > 0)).to(param.data.dtype)
+            tie_mask = (param.data.abs() == threshold) & (old_mask > 0)
+            new_mask = torch.where(tie_mask, old_mask, new_mask)
+            self.masks[name] = new_mask
+
+        self.apply_masks()
+
+    def stats(self) -> Dict[str, float]:
+        total = 0
+        alive = 0
+        for mask in self.masks.values():
+            total += int(mask.numel())
+            alive += int(mask.sum().item())
+        sparsity = 1.0 - (alive / total if total > 0 else 1.0)
+        return {
+            "total_params": float(total),
+            "alive_params": float(alive),
+            "sparsity": float(sparsity),
+        }
+
+
+def cubic_sparsity(step: int, start_step: int, end_step: int, final_sparsity: float) -> float:
+    if step < start_step:
+        return 0.0
+    if step > end_step:
+        return float(final_sparsity)
+
+    span = end_step - start_step
+    if span <= 0:
+        return float(final_sparsity)
+
+    progress = (step - start_step) / span
+    return float(final_sparsity) * (1.0 - (1.0 - progress) ** 3)
 
 
 # =============================
@@ -862,8 +934,8 @@ def train_one_epoch(
     logger: CSVRunLogger,
     epoch: int,
     global_step_start: int,
-    save_grad: bool = False,
-    grad_log_dir: Optional[Path] = None,
+    pruner: Optional[GMPPruner] = None,
+    pruning_cfg: Optional[Dict[str, Any]] = None,
     bg_cfg: Optional[Dict[str, Any]] = None,
     seed: int = 0,
 ) -> int:
@@ -930,18 +1002,61 @@ def train_one_epoch(
         logits = model(x)
         loss = criterion(logits, y)
         loss.backward()
-        if save_grad and grad_log_dir is not None:
-            grad_path = grad_log_dir / f"epoch_{epoch:04d}_step_{global_step:06d}.pt"
-            save_model_grads(model, grad_path)
+        if pruner is not None:
+            pruner.mask_gradients()
         optim.step()
+        if pruner is not None:
+            pruner.apply_masks()
+            if pruning_cfg is not None:
+                start_step = int(pruning_cfg["start_step"])
+                end_step = int(pruning_cfg["end_step"])
+                prune_freq = int(pruning_cfg["prune_freq"])
+                if (
+                    global_step >= start_step
+                    and global_step <= end_step
+                    and prune_freq > 0
+                    and global_step % prune_freq == 0
+                ):
+                    target_sparsity = cubic_sparsity(
+                        global_step,
+                        start_step=start_step,
+                        end_step=end_step,
+                        final_sparsity=float(pruning_cfg["final_sparsity"]),
+                    )
+                    pruner.update_masks(target_sparsity)
 
         with torch.no_grad():
             preds = logits.argmax(dim=1)
             acc = float((preds == y).float().mean().item())
+            prune_stats = pruner.stats() if pruner is not None else None
 
         # Update logger state (will be sampled at 1 FPS)
         lr = float(optim.param_groups[0].get("lr", 0.0))
-        logger.update_state(epoch=epoch, step=step, global_step=global_step, loss=float(loss.item()), lr=lr, acc=acc)
+        state_update: Dict[str, Any] = {
+            "epoch": epoch,
+            "step": step,
+            "global_step": global_step,
+            "loss": float(loss.item()),
+            "lr": lr,
+            "acc": acc,
+        }
+        if prune_stats is not None:
+            state_update.update(
+                prune_target_sparsity=(
+                    cubic_sparsity(
+                        global_step,
+                        start_step=int(pruning_cfg["start_step"]),
+                        end_step=int(pruning_cfg["end_step"]),
+                        final_sparsity=float(pruning_cfg["final_sparsity"]),
+                    )
+                    if pruning_cfg is not None
+                    else None
+                ),
+                prune_actual_sparsity=float(prune_stats["sparsity"]),
+                prune_alive_params=int(prune_stats["alive_params"]),
+                prune_total_params=int(prune_stats["total_params"]),
+            )
+        logger.update_state(**state_update)
         pbar.set_postfix(loss=f"{loss.item():.4f}", acc=f"{acc:.3f}", lr=f"{lr:.2e}")
 
         global_step += 1
@@ -1035,7 +1150,7 @@ def parse_args() -> argparse.Namespace:
         "--poison-type",
         type=str,
         default="none",
-        choices=["none", "clean", "augmentation", "ood", "blurring", "occlusion", "steganography", "label-flip"],
+        choices=["none", "clean", "blurring", "occlusion", "label-flip"],
     )
     p.add_argument("--poison-frac", type=float, default=1.0, help="Fraction of poison samples to add (0..1)")
     p.add_argument(
@@ -1080,7 +1195,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--epochs", type=int, default=5)
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--optimizer", type=str, default="adam", choices=["adam", "adamw"])
     p.add_argument("--num-workers", type=int, default=2)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -1094,44 +1208,10 @@ def parse_args() -> argparse.Namespace:
         default="simple_cnn",
         choices=["simple_cnn", "mobilenet_v3_large"],
     )
-    p.add_argument(
-        "--dropout",
-        type=float,
-        default=0.0,
-        help="Dropout probability after simple_cnn fc1/fc2; 0 disables dropout",
-    )
 
     # Logging
     p.add_argument("--log-dir", type=str, default="logs")
-    p.add_argument(
-        "--model-save-root",
-        type=str,
-        default="model_checkpoints",
-        help="Root directory for saving the final trained model checkpoint.",
-    )
     p.add_argument("--log-fps", type=float, default=1.0)
-    p.add_argument(
-        "--grad-log-root",
-        type=str,
-        default="grad_logs",
-        help="Root directory for saved gradient .pt files.",
-    )
-    p.add_argument(
-        "--grad-reference-run",
-        action="store_true",
-        help="Save all epoch/step gradients and keep them.",
-    )
-    p.add_argument(
-        "--grad-analysis-ref",
-        type=str,
-        default=None,
-        help=argparse.SUPPRESS,
-    )
-    p.add_argument("--grad-analysis-csv", type=str, default=None, help=argparse.SUPPRESS)
-    p.add_argument("--grad-analysis-log-dir", type=str, default=None, help=argparse.SUPPRESS)
-    p.add_argument("--grad-analysis-eps", type=float, default=0.0, help=argparse.SUPPRESS)
-    p.add_argument("--grad-analysis-layers", type=str, nargs="*", default=None, help=argparse.SUPPRESS)
-    p.add_argument("--keep-grad-after-analysis", action="store_true", help=argparse.SUPPRESS)
     p.add_argument(
         "--disable-perf",
         action="store_true",
@@ -1141,6 +1221,12 @@ def parse_args() -> argparse.Namespace:
     # Subsampling
     p.add_argument("--train-frac", type=float, default=1.0, help="Fraction of train split to use (0..1)")
     p.add_argument("--test-frac", type=float, default=1.0, help="Fraction of test split to use (0..1)")
+
+    # Pruning
+    p.add_argument("--final-sparsity", type=float, default=0.8)
+    p.add_argument("--prune-start-ratio", type=float, default=0.1)
+    p.add_argument("--prune-end-ratio", type=float, default=0.8)
+    p.add_argument("--prune-freq", type=int, default=10)
 
     return p.parse_args()
 
@@ -1224,27 +1310,22 @@ def main() -> None:
     if args.model == "mobilenet_v3_large":
         model = MobileNetV3Large(num_classes=n_classes).to(device)
     else:
-        model = SimpleCNN(n_classes=n_classes, img_size=int(img_size), dropout=float(args.dropout)).to(device)
-    if args.optimizer == "adamw":
-        optim = torch.optim.AdamW(model.parameters(), lr=float(args.lr))
-    else:
-        optim = torch.optim.Adam(model.parameters(), lr=float(args.lr))
+        model = SimpleCNN(n_classes=n_classes, img_size=int(img_size)).to(device)
+    optim = torch.optim.Adam(model.parameters(), lr=float(args.lr))
+    pruner = GMPPruner(model)
+
+    total_steps = int(args.epochs) * max(len(train_loader), 1)
+    pruning_cfg = {
+        "final_sparsity": float(args.final_sparsity),
+        "start_step": int(total_steps * float(args.prune_start_ratio)),
+        "end_step": int(total_steps * float(args.prune_end_ratio)),
+        "prune_freq": int(args.prune_freq),
+    }
 
     # Logger
     log_dir = Path(args.log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
-    model_save_root = Path(args.model_save_root)
-    model_save_root.mkdir(parents=True, exist_ok=True)
-    run_name = _timestamp_name()
-    out_csv = log_dir / f"{run_name}.csv"
-    model_save_path = model_save_root / f"{run_name}_final.pt"
-    grad_log_dir: Optional[Path] = None
-    save_gradients = bool(args.grad_reference_run) or bool(args.grad_analysis_ref)
-    if args.grad_analysis_ref:
-        print("warning: --grad-analysis-ref is deprecated and no analysis will run; saving gradients only.")
-    if save_gradients:
-        grad_log_dir = Path(args.grad_log_root) / run_name
-        grad_log_dir.mkdir(parents=True, exist_ok=True)
+    out_csv = log_dir / f"{_timestamp_name()}.csv"
 
     proc = psutil.Process(os.getpid())
     collectors: List[MetricsCollector] = [SystemCollector(proc)]
@@ -1263,6 +1344,10 @@ def main() -> None:
         loss=None,
         lr=float(args.lr),
         acc=None,
+        prune_target_sparsity=0.0,
+        prune_actual_sparsity=0.0,
+        prune_alive_params=None,
+        prune_total_params=None,
     )
     logger.mark_event(
         json.dumps(
@@ -1279,7 +1364,6 @@ def main() -> None:
                     "epochs": int(args.epochs),
                     "batch_size": int(args.batch_size),
                     "lr": float(args.lr),
-                    "optimizer": args.optimizer,
                     "seed": int(args.seed),
                     "train_frac": float(args.train_frac),
                     "test_frac": float(args.test_frac),
@@ -1288,13 +1372,14 @@ def main() -> None:
                     "python": platform.python_version(),
                     "torch": torch.__version__,
                     "model": args.model,
-                    "dropout": float(args.dropout),
-                    "grad_reference_run": bool(args.grad_reference_run),
-                    "grad_log_root": str(args.grad_log_root),
-                    "grad_log_dir": str(grad_log_dir) if grad_log_dir is not None else None,
-                    "grad_analysis_disabled": True,
-                    "grad_analysis_ref_ignored": str(args.grad_analysis_ref) if args.grad_analysis_ref else None,
                     "disable_perf": bool(args.disable_perf),
+                    "final_sparsity": float(args.final_sparsity),
+                    "prune_start_ratio": float(args.prune_start_ratio),
+                    "prune_end_ratio": float(args.prune_end_ratio),
+                    "prune_freq": int(args.prune_freq),
+                    "total_steps": int(total_steps),
+                    "prune_start_step": int(pruning_cfg["start_step"]),
+                    "prune_end_step": int(pruning_cfg["end_step"]),
                     "background_script": args.background_script,
                     "background_bursts_per_epoch": int(args.background_bursts_per_epoch),
                     "background_burst_on_sec": int(args.background_burst_on_sec),
@@ -1311,15 +1396,9 @@ def main() -> None:
     print(f"dataset={args.dataset} split=({train_split},{test_split}) poison={args.poison_type} frac={args.poison_frac}")
     print(f"img_size={img_size} normalize={args.normalize} n_classes={n_classes} device={device}")
     print(f"log_csv={out_csv}")
-    if grad_log_dir is not None:
-        print(f"grad_log_dir={grad_log_dir}")
-    print(f"model_checkpoint={model_save_path}")
 
     # Training
     global_step = 0
-    final_epoch = -1
-    last_epoch_test_loss: Optional[float] = None
-    last_epoch_test_acc: Optional[float] = None
     logger.enable()
     logger.mark_event("train_start")
 
@@ -1361,69 +1440,19 @@ def main() -> None:
                 logger=logger,
                 epoch=epoch,
                 global_step_start=global_step,
-                save_grad=save_gradients,
-                grad_log_dir=grad_log_dir,
+                pruner=pruner,
+                pruning_cfg=pruning_cfg,
                 bg_cfg=bg_cfg,
                 seed=int(args.seed),
-            )
-
-            test_loss, test_acc = evaluate(model, test_loader, device=device)
-            final_epoch = epoch
-            last_epoch_test_loss = float(test_loss)
-            last_epoch_test_acc = float(test_acc)
-            print(f"epoch={epoch} test_loss={test_loss:.4f} test_acc={test_acc:.4f}")
-            logger.mark_event(
-                json.dumps(
-                    {"epoch_eval": {"epoch": epoch, "loss": test_loss, "acc": test_acc}},
-                    ensure_ascii=False,
-                )
             )
 
             # Mark end of each epoch
             logger.mark_event(f"epoch_end_{epoch}")
 
         # Mark end of full training
+        pruner.apply_masks()
         logger.mark_event("train_end")
         logger.disable()
-
-        save_model_checkpoint(
-            model,
-            model_save_path,
-            optimizer=optim,
-            epoch=final_epoch if final_epoch >= 0 else None,
-            global_step=global_step,
-            metrics={
-                "last_epoch_test_loss": float(last_epoch_test_loss) if last_epoch_test_loss is not None else float("nan"),
-                "last_epoch_test_acc": float(last_epoch_test_acc) if last_epoch_test_acc is not None else float("nan"),
-            },
-            run_info={
-                "run_name": run_name,
-                "dataset": args.dataset,
-                "config": args.config,
-                "poison_type": args.poison_type,
-                "poison_frac": float(args.poison_frac),
-                "img_size": int(img_size),
-                "normalize": args.normalize,
-                "epochs": int(args.epochs),
-                "batch_size": int(args.batch_size),
-                "lr": float(args.lr),
-                "optimizer": args.optimizer,
-                "seed": int(args.seed),
-                "device": str(device),
-                "model": args.model,
-                "dropout": float(args.dropout),
-                "train_split": train_split,
-                "test_split": test_split,
-                "log_csv": str(out_csv),
-                "grad_log_dir": str(grad_log_dir) if grad_log_dir is not None else None,
-            },
-        )
-        logger.mark_event(
-            json.dumps(
-                {"model_checkpoint": {"path": str(model_save_path), "epoch": final_epoch, "global_step": global_step}},
-                ensure_ascii=False,
-            )
-        )
 
         # Evaluation (logger disabled by default)
         test_loss, test_acc = evaluate(model, test_loader, device=device)
@@ -1431,6 +1460,7 @@ def main() -> None:
 
         # Record evaluation summary as an event row (does not resume 1FPS logging)
         logger.mark_event(json.dumps({"eval": {"loss": test_loss, "acc": test_acc}}, ensure_ascii=False))
+        logger.mark_event(json.dumps({"pruning": pruner.stats()}, ensure_ascii=False))
 
     finally:
         if bg_proc is not None:

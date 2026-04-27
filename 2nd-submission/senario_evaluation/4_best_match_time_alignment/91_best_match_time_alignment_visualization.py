@@ -12,7 +12,8 @@ import pandas as pd
 
 
 ROOT_DIR = Path(__file__).resolve().parent
-DATA_ROOT = ROOT_DIR / "logs_120"
+PROJECT_ROOT = ROOT_DIR.parent
+DATA_ROOT = PROJECT_ROOT / "logs_120"
 SIGNAL_ORDER = [("mem", "Memory"), *[(f"core_{idx}", f"CPU Rank {idx}") for idx in range(4)]]
 
 
@@ -28,7 +29,7 @@ def _load_module(module_name: str, path: Path):
 def _analysis_module():
     if str(ROOT_DIR) not in sys.path:
         sys.path.insert(0, str(ROOT_DIR))
-    return _load_module("scenario_best_match_alignment_mod", ROOT_DIR / "11_unbinned_ot_analysis.py")
+    return _load_module("scenario_best_match_alignment_mod", ROOT_DIR / "011_unbinned_ot_analysis.py")
 
 
 def _default_csvs(root: Path) -> tuple[Path, Path, Path]:
@@ -185,7 +186,7 @@ def _plot_best_match_alignment(
 
     fig.suptitle(
         f"{pair_title}\nReference: {ref_title}    Target: {target_title}\n"
-        f"Best match based on value_mode={value_mode}, time gap uses relative time from 11_",
+        f"Best match based on value_mode={value_mode}, time gap uses relative time from 011_",
         fontsize=15,
     )
     out_path.parent.mkdir(parents=True, exist_ok=True)
