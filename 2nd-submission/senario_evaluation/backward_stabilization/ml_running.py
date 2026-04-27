@@ -701,6 +701,11 @@ class CSVRunLogger:
             "loss": None,
             "lr": None,
             "acc": None,
+            "grad_clip_norm": None,
+            "grad_norm_before_clip": None,
+            "grad_was_clipped": None,
+            "grad_clip_count": None,
+            "grad_clip_rate": None,
         }
 
         self._header_written = False
@@ -836,6 +841,8 @@ def train_one_epoch(
     criterion = nn.CrossEntropyLoss()
 
     global_step = global_step_start
+    grad_clip_count = 0
+    grad_clip_rate = 0.0
     burst_steps: List[int] = []
     procs: List[subprocess.Popen] = []
 
@@ -895,8 +902,18 @@ def train_one_epoch(
         logits = model(x)
         loss = criterion(logits, y)
         loss.backward()
+        grad_norm_before_clip: Optional[float] = None
+        grad_was_clipped: Optional[int] = None
         if grad_clip_norm > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(grad_clip_norm))
+            grad_norm_before_clip = float(
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    max_norm=float(grad_clip_norm),
+                ).item()
+            )
+            grad_was_clipped = int(grad_norm_before_clip > float(grad_clip_norm))
+            grad_clip_count += grad_was_clipped
+            grad_clip_rate = grad_clip_count / float(step + 1)
         optim.step()
 
         with torch.no_grad():
@@ -905,8 +922,33 @@ def train_one_epoch(
 
         # Update logger state (will be sampled at 1 FPS)
         lr = float(optim.param_groups[0].get("lr", 0.0))
-        logger.update_state(epoch=epoch, step=step, global_step=global_step, loss=float(loss.item()), lr=lr, acc=acc)
-        pbar.set_postfix(loss=f"{loss.item():.4f}", acc=f"{acc:.3f}", lr=f"{lr:.2e}")
+        logger.update_state(
+            epoch=epoch,
+            step=step,
+            global_step=global_step,
+            loss=float(loss.item()),
+            lr=lr,
+            acc=acc,
+            grad_clip_norm=float(grad_clip_norm),
+            grad_norm_before_clip=grad_norm_before_clip,
+            grad_was_clipped=grad_was_clipped,
+            grad_clip_count=grad_clip_count,
+            grad_clip_rate=grad_clip_rate,
+        )
+        postfix = {
+            "loss": f"{loss.item():.4f}",
+            "acc": f"{acc:.3f}",
+            "lr": f"{lr:.2e}",
+        }
+        if grad_clip_norm > 0 and grad_norm_before_clip is not None:
+            postfix.update(
+                {
+                    "grad_norm": f"{grad_norm_before_clip:.3f}",
+                    "clipped": f"{grad_clip_count}/{step + 1}",
+                    "clip_rate": f"{grad_clip_rate:.2%}",
+                }
+            )
+        pbar.set_postfix(postfix)
 
         global_step += 1
 
@@ -936,6 +978,27 @@ def train_one_epoch(
                 )
         except Exception:
             pass
+
+    if grad_clip_norm > 0:
+        epoch_steps = step + 1 if "step" in locals() else 0
+        logger.mark_event(
+            json.dumps(
+                {
+                    "grad_clip_epoch_summary": {
+                        "epoch": epoch,
+                        "grad_clip_norm": float(grad_clip_norm),
+                        "clipped_steps": int(grad_clip_count),
+                        "total_steps": int(epoch_steps),
+                        "clip_rate": float(grad_clip_rate),
+                    }
+                },
+                ensure_ascii=False,
+            )
+        )
+        print(
+            f"grad_clip epoch={epoch} clipped_steps={grad_clip_count}/{epoch_steps} "
+            f"clip_rate={grad_clip_rate:.2%} threshold={float(grad_clip_norm):.4g}"
+        )
 
     return global_step
 
