@@ -2,6 +2,7 @@
 set -e
 
 DATA_ROOT="../data"
+PYTHON_BIN="${0:A:h}/../venv/bin/python"
 EPOCHS=20
 BATCH_SIZE=8
 NUM_WORKERS=0
@@ -28,7 +29,7 @@ run_one() {
   shift 2
 
   local script="senario_evaluation/${scenario}/ml_running.py"
-  local log_dir="senario_evaluation/${scenario}/${poison_type}"
+  local log_dir="senario_evaluation/${scenario}/${poison_type}_20rounds"
 
   echo ""
   echo "============================================================"
@@ -39,14 +40,14 @@ run_one() {
   echo "============================================================"
 
   if [[ "$poison_type" == "blurring" ]]; then
-    python "$script" \
+    "$PYTHON_BIN" "$script" \
       "${COMMON_ARGS[@]}" \
       --poison-type blurring \
       --poison-frac "$POISON_FRAC" \
       --log-dir "$log_dir" \
       "$@"
   else
-    python "$script" \
+    "$PYTHON_BIN" "$script" \
       "${COMMON_ARGS[@]}" \
       --poison-type clean \
       --log-dir "$log_dir" \
@@ -59,7 +60,7 @@ run_repeated() {
   shift
 
   for poison_type in clean blurring; do
-    for run_id in {1..5}; do
+    for ((run_id = 1; run_id <= N_RUNS; ++run_id)); do
       echo ""
       echo "############################################################"
       echo "# Run ${run_id}/${N_RUNS} | ${scenario} | ${poison_type}"
@@ -73,11 +74,11 @@ run_repeated() {
 run_repeated batch_norm
 
 # 2. Label smoothing
-run_repeated label_smoothing
+run_repeated label_smooth
 
 # 3. AdamW weight decay
 run_repeated adamw_weight_decay \
-  --optimizer adamw
+  --weight-decay 1e-4
 
 # 4. Weight normalization
 run_repeated weight_normalization
