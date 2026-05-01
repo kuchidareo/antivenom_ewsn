@@ -20,7 +20,7 @@ Logging (important)
 - Writes ONE timestamped CSV: <log_dir>/<YYYYmmdd_HHMMSS>.csv
 - Logs at 1 FPS by default.
 - Captures system metrics via psutil (CPU, mem, process usage, IO).
-- Captures interval metrics from `perf stat` unless disabled.
+- Captures per-interval `instructions` and `cycles` deltas from `perf stat` unless disabled.
 - Best-effort CPU temperature (if available).
 - Training loop marks train_start/train_end events and only logs while training
   (logger disabled during evaluation by default).
@@ -338,25 +338,8 @@ class MetricsCollector:
 
 class PerfCollector(MetricsCollector):
     DEFAULT_EVENTS: Tuple[str, ...] = (
-        "cycles",
         "instructions",
-        "branch-misses",
-        "cache-misses",
-        "cache-references",
-        "context-switches",
-        "cpu-clock",
-        "cpu-migrations",
-        "major-faults",
-        "minor-faults",
-        "page-faults",
-        "task-clock",
-        "duration_time",
-        "L1-dcache-load-misses",
-        "L1-dcache-loads",
-        "L1-icache-load-misses",
-        "dTLB-load-misses",
-        "dTLB-store-misses",
-        "iTLB-load-misses",
+        "cycles",
     )
 
     def __init__(
@@ -393,7 +376,7 @@ class PerfCollector(MetricsCollector):
     @staticmethod
     def _column_name(event: str) -> str:
         normalized = event.lower().replace("-", "_")
-        return f"perf_{normalized}"
+        return f"perf_{normalized}_delta"
 
     @staticmethod
     def _parse_value(raw: str) -> Optional[float]:
@@ -532,8 +515,9 @@ class PerfCollector(MetricsCollector):
             return None
         ts_raw = parts[0]
         value_raw = parts[1]
-        event_name = parts[2]
-        if not ts_raw or event_name not in self.event_set:
+        # perf CSV formats differ by version; some include a unit field before the event name.
+        event_name = next((part for part in parts[2:] if part in self.event_set), None)
+        if not ts_raw or event_name is None:
             return None
         return ts_raw, event_name, self._parse_value(value_raw)
 
@@ -701,6 +685,11 @@ class CSVRunLogger:
             "loss": None,
             "lr": None,
             "acc": None,
+            "grad_clip_norm": None,
+            "grad_norm_before_clip": None,
+            "grad_was_clipped": None,
+            "grad_clip_count": None,
+            "grad_clip_rate": None,
         }
 
         self._header_written = False
@@ -836,6 +825,8 @@ def train_one_epoch(
     criterion = nn.CrossEntropyLoss()
 
     global_step = global_step_start
+    grad_clip_count = 0
+    grad_clip_rate = 0.0
     burst_steps: List[int] = []
     procs: List[subprocess.Popen] = []
 
@@ -895,8 +886,18 @@ def train_one_epoch(
         logits = model(x)
         loss = criterion(logits, y)
         loss.backward()
+        grad_norm_before_clip: Optional[float] = None
+        grad_was_clipped: Optional[int] = None
         if grad_clip_norm > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(grad_clip_norm))
+            grad_norm_before_clip = float(
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    max_norm=float(grad_clip_norm),
+                ).item()
+            )
+            grad_was_clipped = int(grad_norm_before_clip > float(grad_clip_norm))
+            grad_clip_count += grad_was_clipped
+            grad_clip_rate = grad_clip_count / float(step + 1)
         optim.step()
 
         with torch.no_grad():
@@ -905,8 +906,33 @@ def train_one_epoch(
 
         # Update logger state (will be sampled at 1 FPS)
         lr = float(optim.param_groups[0].get("lr", 0.0))
-        logger.update_state(epoch=epoch, step=step, global_step=global_step, loss=float(loss.item()), lr=lr, acc=acc)
-        pbar.set_postfix(loss=f"{loss.item():.4f}", acc=f"{acc:.3f}", lr=f"{lr:.2e}")
+        logger.update_state(
+            epoch=epoch,
+            step=step,
+            global_step=global_step,
+            loss=float(loss.item()),
+            lr=lr,
+            acc=acc,
+            grad_clip_norm=float(grad_clip_norm),
+            grad_norm_before_clip=grad_norm_before_clip,
+            grad_was_clipped=grad_was_clipped,
+            grad_clip_count=grad_clip_count,
+            grad_clip_rate=grad_clip_rate,
+        )
+        postfix = {
+            "loss": f"{loss.item():.4f}",
+            "acc": f"{acc:.3f}",
+            "lr": f"{lr:.2e}",
+        }
+        if grad_clip_norm > 0 and grad_norm_before_clip is not None:
+            postfix.update(
+                {
+                    "grad_norm": f"{grad_norm_before_clip:.3f}",
+                    "clipped": f"{grad_clip_count}/{step + 1}",
+                    "clip_rate": f"{grad_clip_rate:.2%}",
+                }
+            )
+        pbar.set_postfix(postfix)
 
         global_step += 1
 
@@ -936,6 +962,27 @@ def train_one_epoch(
                 )
         except Exception:
             pass
+
+    if grad_clip_norm > 0:
+        epoch_steps = step + 1 if "step" in locals() else 0
+        logger.mark_event(
+            json.dumps(
+                {
+                    "grad_clip_epoch_summary": {
+                        "epoch": epoch,
+                        "grad_clip_norm": float(grad_clip_norm),
+                        "clipped_steps": int(grad_clip_count),
+                        "total_steps": int(epoch_steps),
+                        "clip_rate": float(grad_clip_rate),
+                    }
+                },
+                ensure_ascii=False,
+            )
+        )
+        print(
+            f"grad_clip epoch={epoch} clipped_steps={grad_clip_count}/{epoch_steps} "
+            f"clip_rate={grad_clip_rate:.2%} threshold={float(grad_clip_norm):.4g}"
+        )
 
     return global_step
 

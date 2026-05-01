@@ -34,6 +34,9 @@ STEP1_COST_FUNCTIONS = (
     "c7_window",
     "c8_shape_zscore",
     "c9_local_variance",
+    "c11",
+    "c12",
+    "c13",
 )
 
 
@@ -415,6 +418,8 @@ def _cost_matrix(
         "time_distance": "c4_time_value",
         "time_distance_delta": "c2_delta",
         "time_distance_shape": "c4_time_value",
+        "value_time": "c11",
+        "time_value_abs": "c11",
     }
     cost_function = aliases.get(cost_function, cost_function)
     if cost_function not in STEP1_COST_FUNCTIONS:
@@ -434,7 +439,7 @@ def _cost_matrix(
     else:
         delta_cost = np.zeros((len(ref["t"]), len(target["t"])), dtype=float)
 
-    if cost_function == "c5_frequency":
+    if cost_function in {"c5_frequency", "c13"}:
         ref_freq = _frequency_features(
             ref,
             window_size=int(window_size),
@@ -458,7 +463,7 @@ def _cost_matrix(
     else:
         curvature_cost = np.zeros((len(ref["t"]), len(target["t"])), dtype=float)
 
-    if cost_function == "c7_window":
+    if cost_function in {"c7_window", "c12"}:
         ref_window = _shape_features(
             ref,
             window_size=int(window_size),
@@ -515,6 +520,12 @@ def _cost_matrix(
         total_cost = zscore_value_cost
     elif cost_function == "c9_local_variance":
         total_cost = local_variance_cost
+    elif cost_function == "c11":
+        total_cost = value_cost + time_cost
+    elif cost_function == "c12":
+        total_cost = window_cost
+    elif cost_function == "c13":
+        total_cost = frequency_cost
     else:
         raise ValueError(f"Unsupported cost function: {cost_function}")
 

@@ -11,7 +11,7 @@ Data
   Each has JPEGs + metadata.jsonl.
 
 Poisoning usage
-- Choose one of: none | clean | blurring | occlusion | label-flip
+- Choose one of: none | clean | backdoor | blurring | occlusion | label-flip
 - `none` loads clean HF training data directly.
 - Other variants load the prepared directory under <data_root>/<variant>/ directly.
 - `--poison-frac` is used only to validate prepared metadata when available.
@@ -197,6 +197,7 @@ class PoisonDiskDataset(Dataset):
         split_name: str,
         tfm_cfg: TransformConfig,
         expected_poison_frac: Optional[float] = None,
+        only_poison_applied: Optional[bool] = None,
     ) -> None:
         self.variant_dir = variant_dir
         self.split_name = split_name
@@ -208,6 +209,7 @@ class PoisonDiskDataset(Dataset):
 
         items: List[Tuple[str, int]] = []
         seen_poison_fracs: set[float] = set()
+        poison_applied_count = 0
         with open(meta_path, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
@@ -217,12 +219,17 @@ class PoisonDiskDataset(Dataset):
                 fname = rec["file"]
                 if not fname.startswith(f"{split_name}_"):
                     continue
+                poison_applied = bool(rec.get("poison_applied", False))
+                if only_poison_applied is not None and poison_applied != only_poison_applied:
+                    continue
                 poison_frac = rec.get("poison_frac")
                 if poison_frac is not None:
                     try:
                         seen_poison_fracs.add(round(float(poison_frac), 6))
                     except (TypeError, ValueError):
                         pass
+                if poison_applied:
+                    poison_applied_count += 1
                 items.append((fname, int(rec["label"])))
 
         if not items:
@@ -230,6 +237,7 @@ class PoisonDiskDataset(Dataset):
 
         self.items = items
         self.prepared_poison_fracs = seen_poison_fracs
+        self.poison_applied_count = poison_applied_count
 
         if expected_poison_frac is not None and seen_poison_fracs:
             expected = round(float(expected_poison_frac), 6)
@@ -263,6 +271,28 @@ def subsample_dataset(ds: Dataset, frac: float, seed: int) -> Dataset:
     rng.shuffle(idxs)
     idxs = idxs[:k]
     return torch.utils.data.Subset(ds, idxs)
+
+
+def resolve_backdoor_data_root(data_root: Path) -> Path:
+    candidates = [
+        data_root / "backdoor",
+        data_root,
+        Path.cwd().parent / "data" / "backdoor",
+    ]
+    for candidate in candidates:
+        if (
+            (candidate / "clean" / "metadata.jsonl").exists()
+            and (candidate / "backdoor" / "metadata.jsonl").exists()
+        ):
+            return candidate
+        if (candidate / "metadata.jsonl").exists():
+            return candidate
+    checked = ", ".join(str(p) for p in candidates)
+    raise FileNotFoundError(
+        "Could not find prepared backdoor data. Expected either a flat metadata.jsonl "
+        "or nested clean/metadata.jsonl and backdoor/metadata.jsonl under one of: "
+        f"{checked}"
+    )
 
 
 # =============================
@@ -978,9 +1008,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--data-root", type=str, default="data", help="Root containing poisoning dirs")
     p.add_argument(
         "--poison-type",
+        "--poisoning-type",
         type=str,
         default="none",
-        choices=["none", "clean", "blurring", "occlusion", "label-flip"],
+        choices=["none", "clean", "backdoor", "blurring", "occlusion", "label-flip"],
+        dest="poison_type",
     )
     p.add_argument("--poison-frac", type=float, default=1.0, help="Fraction of poison samples to add (0..1)")
     p.add_argument(
@@ -1093,6 +1125,10 @@ def main() -> None:
 
     tfm_cfg = TransformConfig(img_size=int(img_size), normalize=args.normalize)
 
+    backdoor_root: Optional[Path] = None
+    if args.poison_type == "backdoor":
+        backdoor_root = resolve_backdoor_data_root(Path(args.data_root))
+
     # Build datasets
     clean_train = CleanHFDataset(train_hf, image_col=image_col, label_col=label_col, tfm_cfg=tfm_cfg)
     clean_test = CleanHFDataset(test_hf, image_col=image_col, label_col=label_col, tfm_cfg=tfm_cfg)
@@ -1102,8 +1138,49 @@ def main() -> None:
     clean_test = subsample_dataset(clean_test, frac=float(args.test_frac), seed=args.seed + 1)
 
     train_ds: Dataset
+    backdoor_test_loader: Optional[DataLoader] = None
+    effective_poison_frac = float(args.poison_frac)
     if args.poison_type == "none":
         train_ds = clean_train
+    elif args.poison_type == "backdoor":
+        assert backdoor_root is not None
+        if (backdoor_root / "backdoor" / "metadata.jsonl").exists():
+            backdoor_variant_dir = backdoor_root / "backdoor"
+            clean_test_disk = PoisonDiskDataset(
+                variant_dir=backdoor_root / "clean",
+                split_name=test_split,
+                tfm_cfg=tfm_cfg,
+                expected_poison_frac=None,
+            )
+            clean_test = subsample_dataset(clean_test_disk, frac=float(args.test_frac), seed=args.seed + 1)
+        else:
+            backdoor_variant_dir = backdoor_root
+
+        prepared_train = PoisonDiskDataset(
+            variant_dir=backdoor_variant_dir,
+            split_name=train_split,
+            tfm_cfg=tfm_cfg,
+            expected_poison_frac=None,
+        )
+        backdoor_test_attacked = PoisonDiskDataset(
+            variant_dir=backdoor_variant_dir,
+            split_name=test_split,
+            tfm_cfg=tfm_cfg,
+            expected_poison_frac=None,
+            only_poison_applied=True,
+        )
+
+        if prepared_train.prepared_poison_fracs:
+            effective_poison_frac = sorted(prepared_train.prepared_poison_fracs)[0]
+        train_ds = subsample_dataset(prepared_train, frac=float(args.train_frac), seed=args.seed + 2)
+        backdoor_test_ds = subsample_dataset(backdoor_test_attacked, frac=float(args.test_frac), seed=args.seed + 3)
+        backdoor_test_loader = DataLoader(
+            backdoor_test_ds,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=(device.type == "cuda"),
+        )
     else:
         variant_dir = Path(args.data_root) / args.poison_type
         prepared_train = PoisonDiskDataset(
@@ -1170,6 +1247,8 @@ def main() -> None:
                     "test_split": test_split,
                     "poison_type": args.poison_type,
                     "poison_frac": float(args.poison_frac),
+                    "effective_poison_frac": float(effective_poison_frac),
+                    "backdoor_root": str(backdoor_root) if backdoor_root is not None else None,
                     "img_size": int(img_size),
                     "normalize": args.normalize,
                     "epochs": int(args.epochs),
@@ -1197,7 +1276,13 @@ def main() -> None:
     )
 
     print("=== Run ===")
-    print(f"dataset={args.dataset} split=({train_split},{test_split}) poison={args.poison_type} frac={args.poison_frac}")
+    print(
+        f"dataset={args.dataset} split=({train_split},{test_split}) "
+        f"poison={args.poison_type} frac={effective_poison_frac}"
+    )
+    if backdoor_root is not None:
+        train_poisoned = getattr(prepared_train, "poison_applied_count", None)
+        print(f"backdoor_root={backdoor_root} prepared_train_poisoned={train_poisoned}/{len(prepared_train)}")
     print(f"img_size={img_size} normalize={args.normalize} n_classes={n_classes} device={device}")
     print(f"log_csv={out_csv}")
 
@@ -1248,6 +1333,27 @@ def main() -> None:
                 seed=int(args.seed),
             )
 
+            logger.disable()
+            clean_loss, clean_acc = evaluate(model, test_loader, device=device)
+            epoch_eval: Dict[str, Any] = {
+                "epoch": epoch,
+                "clean_loss": clean_loss,
+                "clean_acc": clean_acc,
+            }
+            msg = f"epoch={epoch} clean_loss={clean_loss:.4f} clean_acc={clean_acc:.4f}"
+            if backdoor_test_loader is not None:
+                attack_loss, attack_success_rate = evaluate(model, backdoor_test_loader, device=device)
+                epoch_eval.update(
+                    {
+                        "attack_loss": attack_loss,
+                        "attack_success_rate": attack_success_rate,
+                    }
+                )
+                msg += f" attack_loss={attack_loss:.4f} attack_success_rate={attack_success_rate:.4f}"
+            print(msg)
+            logger.mark_event(json.dumps({"epoch_eval": epoch_eval}, ensure_ascii=False))
+            logger.enable()
+
             # Mark end of each epoch
             logger.mark_event(f"epoch_end_{epoch}")
 
@@ -1255,12 +1361,23 @@ def main() -> None:
         logger.mark_event("train_end")
         logger.disable()
 
-        # Evaluation (logger disabled by default)
+        # Final evaluation summary.
         test_loss, test_acc = evaluate(model, test_loader, device=device)
-        print(f"test_loss={test_loss:.4f} test_acc={test_acc:.4f}")
+        final_eval: Dict[str, Any] = {"clean_loss": test_loss, "clean_acc": test_acc}
+        final_msg = f"clean_loss={test_loss:.4f} clean_acc={test_acc:.4f}"
+        if backdoor_test_loader is not None:
+            attack_loss, attack_success_rate = evaluate(model, backdoor_test_loader, device=device)
+            final_eval.update(
+                {
+                    "attack_loss": attack_loss,
+                    "attack_success_rate": attack_success_rate,
+                }
+            )
+            final_msg += f" attack_loss={attack_loss:.4f} attack_success_rate={attack_success_rate:.4f}"
+        print(final_msg)
 
         # Record evaluation summary as an event row (does not resume 1FPS logging)
-        logger.mark_event(json.dumps({"eval": {"loss": test_loss, "acc": test_acc}}, ensure_ascii=False))
+        logger.mark_event(json.dumps({"eval": final_eval}, ensure_ascii=False))
 
     finally:
         if bg_proc is not None:

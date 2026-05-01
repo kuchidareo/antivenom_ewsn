@@ -20,7 +20,7 @@ Logging (important)
 - Writes ONE timestamped CSV: <log_dir>/<YYYYmmdd_HHMMSS>.csv
 - Logs at 1 FPS by default.
 - Captures system metrics via psutil (CPU, mem, process usage, IO).
-- Captures interval metrics from `perf stat` unless disabled.
+- Captures per-interval `instructions` and `cycles` deltas from `perf stat` unless disabled.
 - Best-effort CPU temperature (if available).
 - Training loop marks train_start/train_end events and only logs while training
   (logger disabled during evaluation by default).
@@ -338,25 +338,8 @@ class MetricsCollector:
 
 class PerfCollector(MetricsCollector):
     DEFAULT_EVENTS: Tuple[str, ...] = (
-        "cycles",
         "instructions",
-        "branch-misses",
-        "cache-misses",
-        "cache-references",
-        "context-switches",
-        "cpu-clock",
-        "cpu-migrations",
-        "major-faults",
-        "minor-faults",
-        "page-faults",
-        "task-clock",
-        "duration_time",
-        "L1-dcache-load-misses",
-        "L1-dcache-loads",
-        "L1-icache-load-misses",
-        "dTLB-load-misses",
-        "dTLB-store-misses",
-        "iTLB-load-misses",
+        "cycles",
     )
 
     def __init__(
@@ -393,7 +376,7 @@ class PerfCollector(MetricsCollector):
     @staticmethod
     def _column_name(event: str) -> str:
         normalized = event.lower().replace("-", "_")
-        return f"perf_{normalized}"
+        return f"perf_{normalized}_delta"
 
     @staticmethod
     def _parse_value(raw: str) -> Optional[float]:
@@ -532,8 +515,9 @@ class PerfCollector(MetricsCollector):
             return None
         ts_raw = parts[0]
         value_raw = parts[1]
-        event_name = parts[2]
-        if not ts_raw or event_name not in self.event_set:
+        # perf CSV formats differ by version; some include a unit field before the event name.
+        event_name = next((part for part in parts[2:] if part in self.event_set), None)
+        if not ts_raw or event_name is None:
             return None
         return ts_raw, event_name, self._parse_value(value_raw)
 
