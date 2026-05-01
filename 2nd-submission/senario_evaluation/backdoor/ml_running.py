@@ -295,6 +295,36 @@ def resolve_backdoor_data_root(data_root: Path) -> Path:
     )
 
 
+def resolve_traffic_dataset_root(data_root: Path) -> Path:
+    candidates = [
+        data_root / "traffic-dataset",
+        data_root,
+        Path("/home/user/kuchida/antivenom_ewsn/data/traffic-dataset"),
+        Path.cwd().parent / "data" / "traffic-dataset",
+    ]
+    for candidate in candidates:
+        if (
+            (candidate / "dataset_info.json").exists()
+            and (candidate / "clean" / "metadata.jsonl").exists()
+            and (candidate / "backdoor" / "metadata.jsonl").exists()
+        ):
+            return candidate
+    checked = ", ".join(str(p) for p in candidates)
+    raise FileNotFoundError(f"Could not find traffic-dataset under one of: {checked}")
+
+
+def load_traffic_dataset_info(root: Path) -> Dict[str, Any]:
+    info_path = root / "dataset_info.json"
+    with open(info_path, "r", encoding="utf-8") as f:
+        info = json.load(f)
+    class_names = info.get("class_names") or info.get("classes")
+    if not class_names:
+        raise ValueError(f"Missing class_names/classes in {info_path}")
+    info["class_names"] = list(class_names)
+    info["num_classes"] = int(info.get("num_classes", len(class_names)))
+    return info
+
+
 # =============================
 # Model: simple CNN (3 conv, 3 fc)
 # =============================
@@ -1093,103 +1123,163 @@ def main() -> None:
 
     device = torch.device(args.device)
 
-    # Load HF dataset (clean)
-    ds_dict = load_dataset(args.dataset, args.config) if args.config else load_dataset(args.dataset)
-    train_split, test_split = build_splits(ds_dict)
-
-    if test_split == "__split_from_train__":
-        # Split train into train/test
-        ds_dict = ds_dict[train_split].train_test_split(test_size=0.2, seed=args.seed)
-        train_split, test_split = "train", "test"
-
-    train_hf = ds_dict[train_split]
-    test_hf = ds_dict[test_split]
-
-    image_col = _find_image_column(train_hf.features)
-    label_col = _find_label_column(train_hf.features)
-    class_names = _get_class_names(train_hf, label_col)
-
-    # Determine number of classes
-    if class_names is not None:
-        n_classes = len(class_names)
-    else:
-        # best-effort
-        labels = set(int(train_hf[i][label_col]) for i in range(min(len(train_hf), 5000)))
-        n_classes = len(labels)
-
-    # Image size
-    img_size = args.img_size
-    if img_size is None:
-        inferred = infer_img_size(train_hf, image_col)
-        img_size = inferred if inferred is not None else 224
-
-    tfm_cfg = TransformConfig(img_size=int(img_size), normalize=args.normalize)
-
     backdoor_root: Optional[Path] = None
-    if args.poison_type == "backdoor":
-        backdoor_root = resolve_backdoor_data_root(Path(args.data_root))
-
-    # Build datasets
-    clean_train = CleanHFDataset(train_hf, image_col=image_col, label_col=label_col, tfm_cfg=tfm_cfg)
-    clean_test = CleanHFDataset(test_hf, image_col=image_col, label_col=label_col, tfm_cfg=tfm_cfg)
-
-    # Optional subsampling (after inferring classes/img size)
-    clean_train = subsample_dataset(clean_train, frac=float(args.train_frac), seed=args.seed)
-    clean_test = subsample_dataset(clean_test, frac=float(args.test_frac), seed=args.seed + 1)
-
     train_ds: Dataset
+    prepared_train: Optional[PoisonDiskDataset] = None
     backdoor_test_loader: Optional[DataLoader] = None
     effective_poison_frac = float(args.poison_frac)
-    if args.poison_type == "none":
-        train_ds = clean_train
-    elif args.poison_type == "backdoor":
-        assert backdoor_root is not None
-        if (backdoor_root / "backdoor" / "metadata.jsonl").exists():
-            backdoor_variant_dir = backdoor_root / "backdoor"
-            clean_test_disk = PoisonDiskDataset(
-                variant_dir=backdoor_root / "clean",
-                split_name=test_split,
-                tfm_cfg=tfm_cfg,
-                expected_poison_frac=None,
-            )
-            clean_test = subsample_dataset(clean_test_disk, frac=float(args.test_frac), seed=args.seed + 1)
-        else:
-            backdoor_variant_dir = backdoor_root
 
-        prepared_train = PoisonDiskDataset(
-            variant_dir=backdoor_variant_dir,
+    if args.dataset == "traffic-dataset":
+        traffic_root = resolve_traffic_dataset_root(Path(args.data_root))
+        traffic_info = load_traffic_dataset_info(traffic_root)
+        train_split, test_split = "train", "test"
+        class_names = list(traffic_info["class_names"])
+        n_classes = int(traffic_info["num_classes"])
+        img_size = int(args.img_size or traffic_info.get("img_size") or 224)
+        tfm_cfg = TransformConfig(img_size=img_size, normalize=args.normalize)
+        backdoor_root = traffic_root
+
+        clean_train_disk = PoisonDiskDataset(
+            variant_dir=traffic_root / "clean",
             split_name=train_split,
             tfm_cfg=tfm_cfg,
             expected_poison_frac=None,
         )
-        backdoor_test_attacked = PoisonDiskDataset(
-            variant_dir=backdoor_variant_dir,
+        clean_test_disk = PoisonDiskDataset(
+            variant_dir=traffic_root / "clean",
             split_name=test_split,
             tfm_cfg=tfm_cfg,
             expected_poison_frac=None,
-            only_poison_applied=True,
         )
+        clean_train = subsample_dataset(clean_train_disk, frac=float(args.train_frac), seed=args.seed)
+        clean_test = subsample_dataset(clean_test_disk, frac=float(args.test_frac), seed=args.seed + 1)
 
-        if prepared_train.prepared_poison_fracs:
-            effective_poison_frac = sorted(prepared_train.prepared_poison_fracs)[0]
-        train_ds = subsample_dataset(prepared_train, frac=float(args.train_frac), seed=args.seed + 2)
-        backdoor_test_ds = subsample_dataset(backdoor_test_attacked, frac=float(args.test_frac), seed=args.seed + 3)
-        backdoor_test_loader = DataLoader(
-            backdoor_test_ds,
-            batch_size=args.batch_size,
-            shuffle=False,
-            num_workers=args.num_workers,
-            pin_memory=(device.type == "cuda"),
-        )
+        if args.poison_type in {"none", "clean"}:
+            train_ds = clean_train
+            effective_poison_frac = 0.0
+        elif args.poison_type == "backdoor":
+            prepared_train = PoisonDiskDataset(
+                variant_dir=traffic_root / "backdoor",
+                split_name=train_split,
+                tfm_cfg=tfm_cfg,
+                expected_poison_frac=None,
+            )
+            backdoor_test_attacked = PoisonDiskDataset(
+                variant_dir=traffic_root / "backdoor",
+                split_name=test_split,
+                tfm_cfg=tfm_cfg,
+                expected_poison_frac=None,
+                only_poison_applied=True,
+            )
+            if prepared_train.prepared_poison_fracs:
+                effective_poison_frac = sorted(prepared_train.prepared_poison_fracs)[0]
+            train_ds = subsample_dataset(prepared_train, frac=float(args.train_frac), seed=args.seed + 2)
+            backdoor_test_ds = subsample_dataset(backdoor_test_attacked, frac=float(args.test_frac), seed=args.seed + 3)
+            backdoor_test_loader = DataLoader(
+                backdoor_test_ds,
+                batch_size=args.batch_size,
+                shuffle=False,
+                num_workers=args.num_workers,
+                pin_memory=(device.type == "cuda"),
+            )
+        else:
+            raise ValueError(
+                "traffic-dataset only supports --poison-type clean or --poison-type backdoor"
+            )
     else:
-        variant_dir = Path(args.data_root) / args.poison_type
-        prepared_train = PoisonDiskDataset(
-            variant_dir=variant_dir,
-            split_name=train_split,
-            tfm_cfg=tfm_cfg,
-            expected_poison_frac=float(args.poison_frac),
-        )
-        train_ds = subsample_dataset(prepared_train, frac=float(args.train_frac), seed=args.seed + 2)
+        # Load HF dataset (clean)
+        ds_dict = load_dataset(args.dataset, args.config) if args.config else load_dataset(args.dataset)
+        train_split, test_split = build_splits(ds_dict)
+
+        if test_split == "__split_from_train__":
+            # Split train into train/test
+            ds_dict = ds_dict[train_split].train_test_split(test_size=0.2, seed=args.seed)
+            train_split, test_split = "train", "test"
+
+        train_hf = ds_dict[train_split]
+        test_hf = ds_dict[test_split]
+
+        image_col = _find_image_column(train_hf.features)
+        label_col = _find_label_column(train_hf.features)
+        class_names = _get_class_names(train_hf, label_col)
+
+        # Determine number of classes
+        if class_names is not None:
+            n_classes = len(class_names)
+        else:
+            # best-effort
+            labels = set(int(train_hf[i][label_col]) for i in range(min(len(train_hf), 5000)))
+            n_classes = len(labels)
+
+        # Image size
+        img_size = args.img_size
+        if img_size is None:
+            inferred = infer_img_size(train_hf, image_col)
+            img_size = inferred if inferred is not None else 224
+
+        tfm_cfg = TransformConfig(img_size=int(img_size), normalize=args.normalize)
+
+        if args.poison_type == "backdoor":
+            backdoor_root = resolve_backdoor_data_root(Path(args.data_root))
+
+        # Build datasets
+        clean_train = CleanHFDataset(train_hf, image_col=image_col, label_col=label_col, tfm_cfg=tfm_cfg)
+        clean_test = CleanHFDataset(test_hf, image_col=image_col, label_col=label_col, tfm_cfg=tfm_cfg)
+
+        # Optional subsampling (after inferring classes/img size)
+        clean_train = subsample_dataset(clean_train, frac=float(args.train_frac), seed=args.seed)
+        clean_test = subsample_dataset(clean_test, frac=float(args.test_frac), seed=args.seed + 1)
+
+        if args.poison_type == "none":
+            train_ds = clean_train
+        elif args.poison_type == "backdoor":
+            assert backdoor_root is not None
+            if (backdoor_root / "backdoor" / "metadata.jsonl").exists():
+                backdoor_variant_dir = backdoor_root / "backdoor"
+                clean_test_disk = PoisonDiskDataset(
+                    variant_dir=backdoor_root / "clean",
+                    split_name=test_split,
+                    tfm_cfg=tfm_cfg,
+                    expected_poison_frac=None,
+                )
+                clean_test = subsample_dataset(clean_test_disk, frac=float(args.test_frac), seed=args.seed + 1)
+            else:
+                backdoor_variant_dir = backdoor_root
+
+            prepared_train = PoisonDiskDataset(
+                variant_dir=backdoor_variant_dir,
+                split_name=train_split,
+                tfm_cfg=tfm_cfg,
+                expected_poison_frac=None,
+            )
+            backdoor_test_attacked = PoisonDiskDataset(
+                variant_dir=backdoor_variant_dir,
+                split_name=test_split,
+                tfm_cfg=tfm_cfg,
+                expected_poison_frac=None,
+                only_poison_applied=True,
+            )
+
+            if prepared_train.prepared_poison_fracs:
+                effective_poison_frac = sorted(prepared_train.prepared_poison_fracs)[0]
+            train_ds = subsample_dataset(prepared_train, frac=float(args.train_frac), seed=args.seed + 2)
+            backdoor_test_ds = subsample_dataset(backdoor_test_attacked, frac=float(args.test_frac), seed=args.seed + 3)
+            backdoor_test_loader = DataLoader(
+                backdoor_test_ds,
+                batch_size=args.batch_size,
+                shuffle=False,
+                num_workers=args.num_workers,
+                pin_memory=(device.type == "cuda"),
+            )
+        else:
+            variant_dir = Path(args.data_root) / args.poison_type
+            prepared_train = PoisonDiskDataset(
+                variant_dir=variant_dir,
+                split_name=train_split,
+                tfm_cfg=tfm_cfg,
+                expected_poison_frac=float(args.poison_frac),
+            )
+            train_ds = subsample_dataset(prepared_train, frac=float(args.train_frac), seed=args.seed + 2)
 
     train_loader = DataLoader(
         train_ds,
@@ -1282,7 +1372,10 @@ def main() -> None:
     )
     if backdoor_root is not None:
         train_poisoned = getattr(prepared_train, "poison_applied_count", None)
-        print(f"backdoor_root={backdoor_root} prepared_train_poisoned={train_poisoned}/{len(prepared_train)}")
+        if prepared_train is not None:
+            print(f"backdoor_root={backdoor_root} prepared_train_poisoned={train_poisoned}/{len(prepared_train)}")
+        else:
+            print(f"backdoor_root={backdoor_root}")
     print(f"img_size={img_size} normalize={args.normalize} n_classes={n_classes} device={device}")
     print(f"log_csv={out_csv}")
 
